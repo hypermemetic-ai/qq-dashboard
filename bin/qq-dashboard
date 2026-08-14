@@ -1,0 +1,878 @@
+#!/usr/bin/env bash
+# QQ operational terminal dashboard. Credential material is read only for the
+# provider requests that need it and is never included in dashboard output.
+set -u
+
+SCRIPT_PATH=$(realpath -e -- "${BASH_SOURCE[0]}") || exit 1
+SCRIPT_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+# shellcheck source=bin/lib/telemetry-lib.sh
+source "$SCRIPT_DIR/lib/telemetry-lib.sh"
+
+TELEMETRY_HOME="${HOME:-}"
+AUTH_FILE="${TELEMETRY_HOME}/.pi/agent/auth.json"
+PROFILE_COMMAND="${QQ_PROFILE_BIN:-qq-profile}"
+METER_CACHE="${TELEMETRY_HOME}/.local/state/qq/telemetry/meter-cache.json"
+FRAME_FILE="${TELEMETRY_HOME}/.local/state/qq/telemetry/last-frame.txt"
+REFRESH_SECS="${TELEMETRY_REFRESH:-30}"
+QWEN_GW_CADENCE="${TELEMETRY_QWEN_GW_CADENCE:-300}"
+QWEN_MTR_CADENCE="${TELEMETRY_REFRESH:-30}"
+QWEN_SESSION_WINDOW_DAYS=7
+BAR_CELLS=16
+C_RESET=$'\033[0m'
+C_DIM=$'\033[2m'
+C_BOLD=$'\033[1m'
+C_RED=$'\033[31m'
+
+TELEMETRY_TMP=""
+cleanup() {
+  if [ -n "$TELEMETRY_TMP" ] && [ -d "$TELEMETRY_TMP" ]; then
+    rm -rf -- "$TELEMETRY_TMP"
+  fi
+}
+exit_on_signal() {
+  local status="$1"
+  trap - HUP INT TERM
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit_on_signal 129' HUP
+trap 'exit_on_signal 130' INT
+trap 'exit_on_signal 143' TERM
+TELEMETRY_TMP=$(mktemp -d "${TMPDIR:-/tmp}/qq-dashboard.XXXXXX" 2>/dev/null || true)
+
+iso_local() { date -d "$1" '+%m-%d %H:%M %Z' 2>/dev/null || printf '?'; }
+epoch_local() { date -d "@$1" '+%m-%d %H:%M %Z' 2>/dev/null || printf '?'; }
+now_epoch() { date -u +%s; }
+
+api_get() {
+  curl -sS -m 6 -H 'Accept: application/json' "$@" 2>/dev/null || true
+}
+
+refresh_xai_auth() {
+  # Pi refreshes subscription OAuth credentials on use, but this panel reads
+  # auth.json directly. Refresh only when its stored xAI credential is due so
+  # the billing request does not fail with a stale bearer token.
+  local nowms
+  [ -r "$AUTH_FILE" ] || return 0
+  nowms=$(( $(now_epoch) * 1000 ))
+  jq -e --argjson now "$nowms" '
+    .xai.type == "oauth" and
+    ((.xai.expires | type) == "number") and
+    .xai.expires <= $now
+  ' "$AUTH_FILE" >/dev/null 2>&1 || return 0
+  command -v pi >/dev/null 2>&1 || return 0
+  pi auth check --provider xai >/dev/null 2>&1 || true
+}
+
+color_frac() {
+  awk -v f="$1" 'BEGIN { if (f>=0.9) print "\033[31m"; else if (f>=0.6) print "\033[33m"; else print "\033[32m" }'
+}
+
+fmt_usd() {
+  awk -v v="${1:-0}" 'BEGIN { if (v+0<=0) printf "$0.00"; else if (v<1) printf "$%.4f", v; else printf "$%.2f", v }'
+}
+
+row_or_dim() {
+  # Unavailable rows are failures; dim them so live data pops.
+  case "$1" in
+    *unavailable*) printf '%s%s%s' "${C_DIM}" "$1" "${C_RESET}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+exhausted_flag() {
+  # Inline EXHAUSTED marker: shown when the meter is at/over capacity or a
+  # quota-wall rejection is newer than the provider observation being shown.
+  local frac="${1:-0}" wall="${2:-}" wall_ts="${3:-0}" observed_ts="${4:-0}"
+  if [[ "$wall_ts" =~ ^[0-9]+$ && "$observed_ts" =~ ^[0-9]+$ ]] &&
+     [ "$wall_ts" -gt 0 ] && [ "$observed_ts" -gt 0 ] &&
+     [ "$wall_ts" -lt "$((observed_ts * 1000))" ]; then
+    wall=''
+  fi
+  if [ -n "$wall" ] || [ "$(awk -v f="$frac" 'BEGIN { print (f>=1) ? 1 : 0 }')" = 1 ]; then
+    printf '%s' "${C_RED}EXHAUSTED${C_RESET}"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: qq-dashboard [--once] [--help]
+
+Render QQ provider plans, usage, and execution profiles.
+  --once  Fetch and render one screen, then exit.
+  --help  Show this help.
+
+Interactive mode refreshes every 30 seconds by default; press r to refresh or
+q to quit. Set TELEMETRY_REFRESH and TELEMETRY_QWEN_GW_CADENCE to tune cadence.
+EOF
+}
+
+ONCE=0
+
+# Per-provider display state.
+GPT_WEEK='7d       unavailable'
+GROK_WEEK='7d       unavailable'
+QWEN_L1='7d       unavailable'
+QWEN_L2=''
+
+ROLES_BODY=''
+
+profiles_refusal() {
+  printf 'qq-dashboard: execution profiles unavailable from qq-profile\n' >&2
+}
+
+load_roles() {
+  local profiles_json rows kind role model effort mark width=0 first=1 extra
+  local -a kinds=() roles=() models=() efforts=() marks=() lines=()
+  ROLES_BODY="   unavailable"
+  profiles_json=$("$PROFILE_COMMAND" list --json 2>/dev/null) || {
+    profiles_refusal
+    return 0
+  }
+  rows=$(jq -er '
+    def text: type == "string" and length > 0;
+    def profile:
+      type == "object"
+      and (.name | text)
+      and (.provider | text)
+      and (.model | text)
+      and (.effort | text);
+    def role:
+      type == "object"
+      and (.name | text)
+      and (.default | text)
+      and (.profiles | type == "array" and length > 0)
+      and ([.profiles[] | profile] | all)
+      and (.default as $default | [.profiles[].name] | index($default) != null);
+    if type == "object"
+      and .schema == "qq.profile-list/v1"
+      and (.roles | type == "array" and length > 0)
+      and ([.roles[] | role] | all)
+      and (.services | type == "array" and length > 0)
+      and ([.services[] | profile] | all)
+    then
+      (.roles[] as $role
+        | ["role", $role.name, "", "", ""],
+          ($role.profiles[]
+           | ["profile", $role.name, .model, .effort,
+              (if .name == $role.default then "default" else "" end)])),
+      (.services[] | ["service", .name, .model, .effort, ""])
+      | @tsv
+    else error("malformed profile list") end
+  ' <<<"$profiles_json" 2>/dev/null) || {
+    profiles_refusal
+    return 0
+  }
+  ROLES_BODY=''
+  while IFS=$'\t' read -r kind role model effort mark; do
+    [ -n "$kind" ] || continue
+    kinds+=("$kind"); roles+=("$role"); models+=("$model"); efforts+=("$effort"); marks+=("$mark")
+    [ "${#model}" -gt "$width" ] && width=${#model}
+  done <<<"$rows"
+  for i in "${!kinds[@]}"; do
+    if [ "${kinds[$i]}" = role ]; then
+      [ "$first" = 1 ] || lines+=("")
+      first=0
+      lines+=("   ${C_BOLD}${roles[$i]}${C_RESET}")
+    elif [ "${kinds[$i]}" = service ]; then
+      [ "$first" = 1 ] || lines+=("")
+      first=0
+      lines+=("   ${C_BOLD}${roles[$i]} (service)${C_RESET}")
+      lines+=("      $(printf "%-*s" $((width + 2)) "${models[$i]}")${C_DIM}${efforts[$i]}${C_RESET}")
+    else
+      extra=''
+      [ "${marks[$i]}" = default ] && extra="  ${C_DIM}default${C_RESET}"
+      lines+=("      $(printf "%-*s" $((width + 2)) "${models[$i]}")${C_DIM}${efforts[$i]}${C_RESET}${extra}")
+    fi
+  done
+  [ "${#lines[@]}" -eq 0 ] || ROLES_BODY=$(IFS=$'\n'; printf '%s' "${lines[*]}")
+}
+
+# Qwen process-local state. The gateway reading (a reverse-engineered console
+# call gated on browser cookies) is the credit source; the local token meter
+# scans Pi sessions on every panel tick and calibrates a credits-per-token rate
+# against consecutive same-window gateway readings. A non-secret summary of the
+# reading, calibration anchor, and rate persists across panel sessions so a
+# launch during a gateway outage still shows the last reading or a live
+# estimate. Credentials are never persisted or displayed.
+GW_STATE_FILE="${TELEMETRY_HOME}/.local/state/qq/telemetry/qwen-gateway.json"
+QWEN_MTR_TS=0
+QWEN_MTR_T5=''
+QWEN_MTR_T7=''
+QWEN_METER_AVAILABLE=0
+QWEN_WALL_TEXT=''
+QWEN_WALL_TS=0
+QWEN_METER_INIT=0
+QWEN_GW_TS=0
+QWEN_GW_ATTEMPT_TS=0
+QWEN_SEC_TOKEN_CACHE=''
+QWEN_GW_USAGE=''
+QWEN_GW_QCONF=''
+QWEN_GW_SPEC=''
+# Persisted gateway-reading summary (non-secret usage metadata only).
+QWEN_PERSISTED_TS=0
+QWEN_PERSISTED_P1W=''
+QWEN_PERSISTED_P1WR=''
+QWEN_PERSISTED_P5=''
+QWEN_PERSISTED_P5R=''
+QWEN_PERSISTED_SPEC=''
+QWEN_PERSISTED_CEILW=''
+QWEN_PERSISTED_CEIL5=''
+# Calibration anchor: the last same-window gateway reading plus the meter total
+# at that instant; rate is credits per token derived from two such readings.
+QWEN_ANCHOR_TS=0
+QWEN_ANCHOR_TOKENS=0
+QWEN_ANCHOR_CREDITS=0
+QWEN_ANCHOR_RESET=0
+QWEN_RATE=''
+FORCE_QWEN=0
+
+qwen_cookie_args() {
+  # Populate the named array with either an explicitly supplied Cookie header
+  # or curl's cookie-file option. Never read cookie material into panel output.
+  local -n target=$1
+  local cookie_file
+  target=()
+  if [ -n "${TELEMETRY_QWEN_COOKIE:-}" ]; then
+    target=(-H "Cookie: ${TELEMETRY_QWEN_COOKIE}")
+    return 0
+  fi
+  cookie_file="${TELEMETRY_QWEN_COOKIE_FILE:-$TELEMETRY_HOME/.local/state/qq/telemetry/qwen.cookies}"
+  if [ -f "$cookie_file" ]; then
+    # shellcheck disable=SC2034 # target is the caller's nameref output array.
+    target=(-b "$cookie_file")
+    return 0
+  fi
+  return 1
+}
+
+qwen_sec_token() {
+  # Resolve the gateway token: env override wins, then the process-cached
+  # token, then a fresh user/info round-trip. The gateway clears the cache
+  # when the usage call fails so an expired token refreshes on the next
+  # attempt. Runs in the calling shell (nameref), so the cache persists.
+  local -n out=$1
+  if [ -n "${TELEMETRY_QWEN_SEC_TOKEN:-}" ]; then
+    out="$TELEMETRY_QWEN_SEC_TOKEN"
+    return 0
+  fi
+  if [ -n "$QWEN_SEC_TOKEN_CACHE" ]; then
+    out="$QWEN_SEC_TOKEN_CACHE"
+    return 0
+  fi
+  local -a cookie_args=()
+  qwen_cookie_args cookie_args || return 1
+  out=$(api_get 'https://home.qwencloud.com/tool/user/info.json' "${cookie_args[@]}" |
+    jq -r '.data.secToken // empty' 2>/dev/null || true)
+  [ -n "$out" ] && QWEN_SEC_TOKEN_CACHE="$out"
+}
+
+qwen_gateway_fetch() {
+  local sec endpoint
+  local -a cookie_args=()
+  [ -n "$TELEMETRY_TMP" ] || return 1
+  qwen_cookie_args cookie_args || return 1
+  qwen_sec_token sec || return 1
+  [ -n "$sec" ] || return 1
+
+  # usage and quota-config are required; subscription is best-effort (its
+  # specCode falls back to TELEMETRY_QWEN_TIER). A failed usage call clears
+  # the cached token so the next attempt refetches it.
+  for endpoint in usage quota-config; do
+    curl -sS -L -m 8 -X POST 'https://cs-data.qwencloud.com/data/api.json' \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      -H 'Origin: https://home.qwencloud.com' \
+      -H 'Referer: https://home.qwencloud.com/billing/subscription/token-plan-individual' \
+      "${cookie_args[@]}" \
+      --data-urlencode 'product=sfm_bailian' \
+      --data-urlencode 'action=IntlBroadScopeAspnGateway' \
+      --data-urlencode "sec_token=$sec" \
+      --data-urlencode 'region=ap-southeast-1' \
+      --data-urlencode "params={\"Api\":\"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/$endpoint\",\"Data\":{\"cornerstoneParam\":{\"domain\":\"home.qwencloud.com\",\"consoleSite\":\"QWENCLOUD\",\"console\":\"ONE_CONSOLE\",\"xsp_lang\":\"en-US\",\"protocol\":\"V2\",\"productCode\":\"p_efm\"}},\"V\":\"1.0\"}" \
+      >"$TELEMETRY_TMP/$endpoint" 2>/dev/null || {
+        [ "$endpoint" = usage ] && QWEN_SEC_TOKEN_CACHE=''
+        return 1
+      }
+    jq -e '.data.DataV2.data.data != null' "$TELEMETRY_TMP/$endpoint" >/dev/null 2>&1 || {
+      [ "$endpoint" = usage ] && QWEN_SEC_TOKEN_CACHE=''
+      return 1
+    }
+  done
+  curl -sS -L -m 8 -X POST 'https://cs-data.qwencloud.com/data/api.json' \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    -H 'Origin: https://home.qwencloud.com' \
+    -H 'Referer: https://home.qwencloud.com/billing/subscription/token-plan-individual' \
+    "${cookie_args[@]}" \
+    --data-urlencode 'product=sfm_bailian' \
+    --data-urlencode 'action=IntlBroadScopeAspnGateway' \
+    --data-urlencode "sec_token=$sec" \
+    --data-urlencode 'region=ap-southeast-1' \
+    --data-urlencode "params={\"Api\":\"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription\",\"Data\":{\"cornerstoneParam\":{\"domain\":\"home.qwencloud.com\",\"consoleSite\":\"QWENCLOUD\",\"console\":\"ONE_CONSOLE\",\"xsp_lang\":\"en-US\",\"protocol\":\"V2\",\"productCode\":\"p_efm\"}},\"V\":\"1.0\"}" \
+    >"$TELEMETRY_TMP/subscription" 2>/dev/null || true
+}
+
+qwen_meter() {
+  local sessions="$TELEMETRY_HOME/.pi/agent/sessions" state_dir cache_work
+  local changed_list matched_lines scanned_json totals nowms cutoff7 cutoff5
+  local -a changed_files=()
+  [ -d "$sessions" ] || { QWEN_METER_AVAILABLE=0; return 1; }
+  [ -n "$TELEMETRY_TMP" ] || { QWEN_METER_AVAILABLE=0; return 1; }
+
+  state_dir=$(dirname -- "$METER_CACHE")
+  mkdir -p -- "$state_dir" 2>/dev/null || { QWEN_METER_AVAILABLE=0; return 1; }
+  cache_work="$TELEMETRY_TMP/meter-cache-source.json"
+  changed_list="$TELEMETRY_TMP/meter-changed.txt"
+  matched_lines="$TELEMETRY_TMP/meter-qwen-lines.txt"
+  scanned_json="$TELEMETRY_TMP/meter-scanned.json"
+  manifest_file="$state_dir/meter-manifest.tsv"
+  cache_invalid=0
+  if [ -r "$METER_CACHE" ] && jq -e '
+      type == "object" and
+      (.version | type) == "number" and
+      .version == 2
+    ' "$METER_CACHE" >/dev/null 2>&1; then
+    cp -- "$METER_CACHE" "$cache_work"
+  else
+    # Version 2 stores only events selected by the exact top-level message
+    # provider. Unversioned/older entries may contain pre-fix false matches, so
+    # starting with an empty cache deliberately forces one full corpus rescan.
+    printf '{"version":2}\n' >"$cache_work"
+    cache_invalid=1
+  fi
+
+  nowms=$(( $(now_epoch) * 1000 ))
+  cutoff7=$(( nowms - QWEN_SESSION_WINDOW_DAYS * 24 * 3600 * 1000 ))
+  cutoff5=$(( nowms - 5 * 3600 * 1000 ))
+
+  # One find pass feeds a single awk that truncates fractional mtimes, diffs
+  # against the previous tick's manifest, emits changed/removed paths, and
+  # writes the new manifest. Generated Pi session paths contain neither tabs
+  # nor newlines, so the manifest is a plain path\tmtime\tsize TSV kept next
+  # to the cache. The previous manifest is preloaded with getline (not
+  # NR==FNR, which misbehaves when the manifest is empty on the first run).
+  [ -f "$manifest_file" ] || : >"$manifest_file"
+  find "$sessions" -type f -name '*.jsonl' -printf '%p\t%T@\t%s\n' 2>/dev/null \
+    | awk -F '\t' -v manifest_out="$manifest_file" -v prevfile="$manifest_file" '
+        BEGIN {
+          while ((getline line < prevfile) > 0) {
+            n = split(line, f, "\t")
+            if (n >= 3) prev[f[1]] = f[2] "\t" f[3]
+          }
+          close(prevfile)
+        }
+        { sub(/\..*/, "", $2) }
+        $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
+          cur[$1] = $2 FS $3
+          if (prev[$1] != cur[$1]) print $1
+        }
+        END {
+          for (p in prev) if (!(p in cur)) print p
+          for (p in cur) print p "\t" cur[p] > manifest_out
+        }
+      ' - >"$changed_list"
+  mapfile -t changed_files <"$changed_list"
+
+  # Idle tick: nothing changed, the cache is current, and totals are known.
+  if [ "${#changed_files[@]}" -eq 0 ] && [ "$cache_invalid" = 0 ] && [ "${QWEN_METER_INIT:-0}" = 1 ]; then
+    return 0
+  fi
+
+  : >"$matched_lines"
+  if [ "${#changed_files[@]}" -gt 0 ]; then
+    grep -H -E '"provider"[[:space:]]*:[[:space:]]*"qwen-token-plan"' \
+      "${changed_files[@]}" >"$matched_lines" 2>/dev/null || true
+  fi
+  if [ -s "$matched_lines" ]; then
+    jq -Rn --argjson cutoff7 "$cutoff7" '
+    reduce inputs as $raw ({};
+      ($raw | index(":")) as $separator |
+      if $separator == null then . else
+        ($raw[0:$separator]) as $path |
+        (try ($raw[$separator + 1:] | fromjson) catch null) as $message |
+        if $message == null then . else
+          .[$path] = (.[$path] // {events: [], walls: []}) |
+          if ($message.message.provider == "qwen-token-plan" and
+              $message.message.stopReason != "error" and
+              ($message.message.timestamp | type) == "number" and
+              ($message.message.usage.totalTokens | type) == "number" and
+              $message.message.timestamp >= $cutoff7) then
+            .[$path].events += [[$message.message.timestamp, $message.message.usage.totalTokens]]
+          elif ($message.message.provider == "qwen-token-plan" and
+              $message.message.stopReason == "error" and
+              (($message.message.errorMessage // "") |
+                test("quota has been exhausted"; "i")) and
+              ($message.message.timestamp // 0) >= $cutoff7) then
+            .[$path].walls += [{timestamp: ($message.message.timestamp // 0), text: "quota exhausted"}]
+          elif ($message.message.provider == "qwen-token-plan" and
+              $message.message.stopReason == "error" and
+              (($message.message.errorMessage // "") |
+                test("insufficient_quota"; "i")) and
+              ($message.message.timestamp // 0) >= $cutoff7) then
+            .[$path].walls += [{timestamp: ($message.message.timestamp // 0), text: "insufficient quota"}]
+          else . end
+        end
+      end)
+  ' <"$matched_lines" >"$scanned_json" || { QWEN_METER_AVAILABLE=0; return 1; }
+  else
+    printf '{}\n' >"$scanned_json"
+  fi
+
+  jq -n --argjson cutoff7 "$cutoff7" --argjson cutoff5 "$cutoff5" \
+    --rawfile manifest "$manifest_file" --slurpfile old "$cache_work" --slurpfile scanned "$scanned_json" '
+      def canonical_wall:
+        (.text // "") as $text |
+        if ($text | test("quota has been exhausted|^quota exhausted$"; "i")) then
+          {timestamp: .timestamp, text: "quota exhausted"}
+        elif ($text | test("insufficient_quota|^insufficient quota$"; "i")) then
+          {timestamp: .timestamp, text: "insufficient quota"}
+        else empty end;
+      (($manifest | split("\n")) | map(select(length > 0)) | map(split("\t") | select(length >= 3) | {key: .[0], mtime: (.[1] | tonumber), size: (.[2] | tonumber)})) as $files |
+      reduce ($files[]) as $file ({version: 2};
+        ($old[0][$file.key] // {}) as $cached |
+        (($cached.mtime != $file.mtime) or
+          ($cached.size != $file.size) or
+          (($cached.events | type) != "array") or
+          (($cached.walls | type) != "array")) as $changed |
+        (if $changed then ($scanned[0][$file.key] // {events: [], walls: []}) else $cached end) as $source |
+        [$source.events[]? | select(.[0] >= $cutoff7)] as $events |
+        [$source.walls[]? | select((.timestamp | type) == "number" and .timestamp >= $cutoff7) | canonical_wall] as $walls |
+        .[$file.key] = {
+          mtime: $file.mtime,
+          size: $file.size,
+          sum7d: ([$events[]? | .[1]] | add // 0),
+          sum5h: ([$events[]? | select(.[0] >= $cutoff5) | .[1]] | add // 0),
+          events: $events,
+          walls: $walls
+        })
+  ' >"$TELEMETRY_TMP/meter-cache-new.json" || { QWEN_METER_AVAILABLE=0; return 1; }
+  chmod 600 "$TELEMETRY_TMP/meter-cache-new.json" 2>/dev/null || true
+  mv -f -- "$TELEMETRY_TMP/meter-cache-new.json" "$METER_CACHE" || {
+    QWEN_METER_AVAILABLE=0
+    return 1
+  }
+
+  totals=$(jq -r '
+    def entries: to_entries[] | select(.key != "version") | .value;
+    ([entries | .sum5h // 0] | add // 0),
+    ([entries | .sum7d // 0] | add // 0),
+    ([entries | .walls[]?] | sort_by(.timestamp) | (last.text // "")),
+    ([entries | .walls[]?] | sort_by(.timestamp) | (last.timestamp // 0))
+  ' "$METER_CACHE" 2>/dev/null) || { QWEN_METER_AVAILABLE=0; return 1; }
+  QWEN_MTR_T5=$(sed -n '1p' <<<"$totals")
+  QWEN_MTR_T7=$(sed -n '2p' <<<"$totals")
+  QWEN_WALL_TEXT=$(sed -n '3p' <<<"$totals")
+  QWEN_WALL_TS=$(sed -n '4p' <<<"$totals")
+  QWEN_METER_INIT=1
+  QWEN_METER_AVAILABLE=1
+}
+
+fmt_age() {
+  local s="$1" h m
+  [ "$s" -lt 0 ] && s=0
+  h=$((s / 3600))
+  m=$(((s % 3600) / 60))
+  if [ "$h" -gt 0 ]; then
+    if [ "$m" -gt 0 ]; then printf '%dh %dm ago' "$h" "$m"; else printf '%dh ago' "$h"; fi
+  else
+    printf '%ds ago' "$s"
+  fi
+}
+
+qwen_gateway_state_load() {
+  # Read the persisted non-secret gateway summary (last reading + calibration
+  # anchor + rate) so a fresh panel launch during an outage still has data.
+  # Malformed or missing state fails closed with empty vars.
+  local f="$GW_STATE_FILE"
+  [ -r "$f" ] || return 1
+  [ ! -L "$f" ] || return 1
+  jq -e '
+    .version == 1 and
+    ((.ts | type) == "number") and
+    ((.p1w | type) == "number") and
+    ((.p1wr | type) == "number") and
+    ((.ceilw | type) == "number") and
+    (.anchor == null or ((.anchor | type) == "object" and (.anchor.ts | type) == "number")) and
+    (.rate == null or (.rate | type) == "number")
+  ' "$f" >/dev/null 2>&1 || return 1
+  QWEN_PERSISTED_TS=$(jq -r '.ts' "$f")
+  QWEN_PERSISTED_P1W=$(jq -r '.p1w // empty' "$f")
+  QWEN_PERSISTED_P1WR=$(jq -r '.p1wr // empty' "$f")
+  QWEN_PERSISTED_P5=$(jq -r '.p5 // empty' "$f")
+  QWEN_PERSISTED_P5R=$(jq -r '.p5r // empty' "$f")
+  QWEN_PERSISTED_SPEC=$(jq -r '.spec // empty' "$f")
+  QWEN_PERSISTED_CEILW=$(jq -r '.ceilw // empty' "$f")
+  QWEN_PERSISTED_CEIL5=$(jq -r '.ceil5 // empty' "$f")
+  QWEN_ANCHOR_TS=$(jq -r '.anchor.ts // 0' "$f")
+  QWEN_ANCHOR_TOKENS=$(jq -r '.anchor.tokens // 0' "$f")
+  QWEN_ANCHOR_CREDITS=$(jq -r '.anchor.credits // 0' "$f")
+  QWEN_ANCHOR_RESET=$(jq -r '.anchor.reset // 0' "$f")
+  QWEN_RATE=$(jq -r '.rate // empty' "$f")
+}
+
+qwen_gateway_state_save() {
+  # Persist usage metadata only (percentages, ceilings, reset times, anchor,
+  # rate). Never payload text, tokens, cookies, or gateway secrets.
+  local tmp="$TELEMETRY_TMP/qwen-gateway.json" state_dir
+  [ -n "$TELEMETRY_TMP" ] || return 1
+  state_dir=$(dirname -- "$GW_STATE_FILE")
+  mkdir -p -- "$state_dir" 2>/dev/null || return 1
+  jq -n --argjson ts "$QWEN_PERSISTED_TS" \
+       --argjson p1w "${QWEN_PERSISTED_P1W:-0}" --argjson p1wr "${QWEN_PERSISTED_P1WR:-0}" \
+       --argjson p5 "${QWEN_PERSISTED_P5:-null}" --argjson p5r "${QWEN_PERSISTED_P5R:-null}" \
+       --arg spec "$QWEN_PERSISTED_SPEC" \
+       --argjson ceilw "${QWEN_PERSISTED_CEILW:-0}" --argjson ceil5 "${QWEN_PERSISTED_CEIL5:-0}" \
+       --argjson ats "$QWEN_ANCHOR_TS" --argjson atok "$QWEN_ANCHOR_TOKENS" \
+       --argjson acr "$QWEN_ANCHOR_CREDITS" --argjson ars "$QWEN_ANCHOR_RESET" \
+       --argjson rate "${QWEN_RATE:-null}" \
+    '{version: 1, ts: $ts, p1w: $p1w, p1wr: $p1wr, p5: $p5, p5r: $p5r, spec: $spec,
+      ceilw: $ceilw, ceil5: $ceil5,
+      anchor: {ts: $ats, tokens: $atok, credits: $acr, reset: $ars},
+      rate: $rate}' >"$tmp" 2>/dev/null || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$GW_STATE_FILE" || return 1
+}
+
+qwen_render_rows() {
+  # Build the standard 7d/5h rows (bar, used/limit, reset) from gateway values.
+  # dim=1 renders fully dimmed rows for a stale last reading, with the optional
+  # note (e.g. the age) appended inside the dim span; the EXHAUSTED wall flag
+  # stays colored in both styles.
+  local p1w="$1" p1wr="$2" p5="$3" p5r="$4" ceilw="$5" ceil5="$6" dim="${7:-0}" note="${8:-}" observed_ts="${9:-0}"
+  local tokenw used5 col flag weekly_inactive=0 weekly_reset five_reset
+  QWEN_L1='7d       unavailable'
+  QWEN_L2=''
+  if [[ "$p1w" =~ ^[0-9]+([.][0-9]+)?$ && "$ceilw" =~ ^[0-9]+$ ]]; then
+    if [[ "$p1wr" =~ ^[0-9]+$ ]]; then
+      weekly_reset="reset $(epoch_local "$((p1wr / 1000))")"
+    elif [ "$(awk -v p="$p1w" 'BEGIN { print (p==0) ? 1 : 0 }')" = 1 ]; then
+      # Qwen omits reset timestamps immediately after renewal until the first
+      # request starts the new quota windows. Zero usage is still live truth.
+      weekly_inactive=1
+      weekly_reset='window not started'
+    else
+      weekly_reset=''
+    fi
+    if [ -n "$weekly_reset" ]; then
+      tokenw=$(awk -v p="$p1w" -v c="$ceilw" 'BEGIN { printf "%d", p*c }')
+      flag="$(exhausted_flag "$p1w" "$QWEN_WALL_TEXT" "$QWEN_WALL_TS" "$observed_ts")"
+      if [ "$dim" = 1 ]; then
+        QWEN_L1="${C_DIM}7d       $(bar "$p1w") $(fmt_num "$tokenw") / $(fmt_num "$ceilw")   ${weekly_reset}  ${note}${C_RESET}"
+      else
+        col=$(color_frac "$p1w")
+        QWEN_L1="7d       ${col}$(bar "$p1w")${C_RESET} ${col}$(fmt_num "$tokenw") / $(fmt_num "$ceilw")${C_RESET}   ${C_DIM}${weekly_reset}${C_RESET}"
+      fi
+      [ -n "$flag" ] && QWEN_L1+="  $flag"
+    fi
+  fi
+  if [ "$weekly_inactive" = 1 ] && [ -z "$p5" ]; then
+    p5=0
+  fi
+  if [[ "$p5" =~ ^[0-9]+([.][0-9]+)?$ && "$ceil5" =~ ^[0-9]+$ ]]; then
+    if [[ "$p5r" =~ ^[0-9]+$ ]]; then
+      five_reset="reset $(epoch_local "$((p5r / 1000))")"
+    elif [ "$(awk -v p="$p5" 'BEGIN { print (p==0) ? 1 : 0 }')" = 1 ]; then
+      five_reset='window not started'
+    else
+      five_reset=''
+    fi
+    if [ -n "$five_reset" ]; then
+      used5=$(awk -v p="$p5" -v c="$ceil5" 'BEGIN { printf "%d", p*c }')
+      if [ "$dim" = 1 ]; then
+        QWEN_L2="${C_DIM}5h       $(bar "$p5") $(fmt_num "$used5") / $(fmt_num "$ceil5")   ${five_reset}${C_RESET}"
+      else
+        col=$(color_frac "$p5")
+        QWEN_L2="5h       ${col}$(bar "$p5")${C_RESET} ${col}$(fmt_num "$used5") / $(fmt_num "$ceil5")${C_RESET}   ${C_DIM}${five_reset}${C_RESET}"
+      fi
+    fi
+  fi
+}
+
+qwen_update() {
+  local now="$1" age spec fetched=0
+  local usage qconf p5 p1w p5r p1wr ceil5n ceilwn tokenw frac col flag projected
+  QWEN_L1='7d       unavailable'
+  QWEN_L2=''
+
+  qwen_gateway_state_load
+
+  if [ "$((now - QWEN_MTR_TS))" -ge "$QWEN_MTR_CADENCE" ]; then
+    qwen_meter || true
+    QWEN_MTR_TS=$(now_epoch)
+  fi
+
+  if qwen_cookie_args _qwen_cookie_probe 2>/dev/null; then
+    # Both clocks must be due: the success clock controls freshness labels,
+    # while the attempt clock prevents a failed gateway from retrying each tick.
+    if { [ "$((now - QWEN_GW_TS))" -ge "$QWEN_GW_CADENCE" ] &&
+         [ "$((now - QWEN_GW_ATTEMPT_TS))" -ge "$QWEN_GW_CADENCE" ]; } ||
+       [ "$FORCE_QWEN" = 1 ]; then
+      QWEN_GW_ATTEMPT_TS=$now
+      if qwen_gateway_fetch; then
+        QWEN_GW_USAGE=$(cat "$TELEMETRY_TMP/usage")
+        QWEN_GW_QCONF=$(cat "$TELEMETRY_TMP/quota-config")
+        QWEN_GW_SPEC=$(jq -r '.data.DataV2.data.data.specCode // empty' "$TELEMETRY_TMP/subscription" 2>/dev/null || true)
+        [ -n "$QWEN_GW_SPEC" ] || QWEN_GW_SPEC="${TELEMETRY_QWEN_TIER:-}"
+        QWEN_GW_TS=$now
+        fetched=1
+      fi
+      FORCE_QWEN=0
+    fi
+  fi
+
+  spec="$QWEN_GW_SPEC"
+
+  # State 1 — the gateway reading fetched this session, fresh within one
+  # cadence, is vendor truth rendered in the standard row shape. It stays on
+  # screen across the cadence instead of vanishing after a few seconds.
+  if [ -n "$QWEN_GW_USAGE" ] && [ -n "$QWEN_GW_QCONF" ] && [ "$QWEN_GW_TS" -gt 0 ] && [ "$((now - QWEN_GW_TS))" -le "$QWEN_GW_CADENCE" ]; then
+    usage="$QWEN_GW_USAGE"
+    qconf="$QWEN_GW_QCONF"
+    p5=$(jq -r '.data.DataV2.data.data.per5HourPercentage // empty' <<<"$usage" 2>/dev/null || true)
+    p1w=$(jq -r '.data.DataV2.data.data.per1WeekPercentage // empty' <<<"$usage" 2>/dev/null || true)
+    p5r=$(jq -r '.data.DataV2.data.data.per5HourResetTime // empty' <<<"$usage" 2>/dev/null || true)
+    p1wr=$(jq -r '.data.DataV2.data.data.per1WeekResetTime // empty' <<<"$usage" 2>/dev/null || true)
+    ceil5n=$(tier_ceiling "$qconf" "$spec" five_hour || true)
+    ceilwn=$(tier_ceiling "$qconf" "$spec" weekly || true)
+    qwen_render_rows "$p1w" "$p1wr" "$p5" "$p5r" "$ceilwn" "$ceil5n" 0 '' "$QWEN_GW_TS"
+    if [ "$QWEN_L1" != '7d       unavailable' ]; then
+      if [ "$fetched" = 1 ]; then
+        tokenw=$(awk -v p="$p1w" -v c="$ceilwn" 'BEGIN { printf "%d", p*c }')
+        # Refresh the persisted summary and calibrate: two same-window readings
+        # (this one and the previous, in-session or from an earlier panel run)
+        # give the credits-per-token rate that powers the live estimate.
+        if [ "$QWEN_METER_AVAILABLE" = 1 ] && [ "$QWEN_METER_INIT" = 1 ] && [[ "$p1wr" =~ ^[0-9]+$ ]]; then
+          if [ "$QWEN_ANCHOR_TS" -gt 0 ] && [ "$QWEN_ANCHOR_RESET" = "$p1wr" ]; then
+            local delta_tokens delta_credits
+            delta_tokens=$((QWEN_MTR_T7 - QWEN_ANCHOR_TOKENS))
+            delta_credits=$((tokenw - QWEN_ANCHOR_CREDITS))
+            if [ "$delta_tokens" -gt 0 ] && [ "$delta_credits" -ge 0 ]; then
+              QWEN_RATE=$(awk -v d="$delta_credits" -v t="$delta_tokens" 'BEGIN { printf "%.9f", d/t }')
+            else
+              QWEN_RATE=''
+            fi
+          else
+            QWEN_RATE=''
+          fi
+          QWEN_ANCHOR_TS=$(now_epoch)
+          QWEN_ANCHOR_TOKENS=$QWEN_MTR_T7
+          QWEN_ANCHOR_CREDITS=$tokenw
+          QWEN_ANCHOR_RESET=$p1wr
+        else
+          QWEN_RATE=''
+          if ! [[ "$p1wr" =~ ^[0-9]+$ ]]; then
+            QWEN_ANCHOR_TS=0
+            QWEN_ANCHOR_TOKENS=0
+            QWEN_ANCHOR_CREDITS=0
+            QWEN_ANCHOR_RESET=0
+          fi
+        fi
+        QWEN_PERSISTED_TS=$now
+        QWEN_PERSISTED_P1W=$p1w
+        QWEN_PERSISTED_P1WR=$p1wr
+        QWEN_PERSISTED_P5=$p5
+        QWEN_PERSISTED_P5R=$p5r
+        QWEN_PERSISTED_SPEC=$spec
+        QWEN_PERSISTED_CEILW=$ceilwn
+        QWEN_PERSISTED_CEIL5=$ceil5n
+        qwen_gateway_state_save || true
+      fi
+      return
+    fi
+  fi
+
+  # State 2 — gateway stale or unreachable; a calibrated anchor and rate turn
+  # the live meter into a credit estimate that moves every tick.
+  if [ -n "$QWEN_RATE" ] && [ "$QWEN_ANCHOR_TS" -gt 0 ] &&
+     [ "$QWEN_METER_AVAILABLE" = 1 ] && [ "$QWEN_METER_INIT" = 1 ] &&
+     [ -n "$QWEN_PERSISTED_CEILW" ] && [ -n "$QWEN_PERSISTED_P1WR" ] &&
+     [ "$QWEN_ANCHOR_RESET" = "$QWEN_PERSISTED_P1WR" ] &&
+     [ "$now" -le "$((QWEN_PERSISTED_P1WR / 1000))" ]; then
+    projected=$(awk -v a="$QWEN_ANCHOR_CREDITS" -v r="$QWEN_RATE" -v t="$QWEN_MTR_T7" -v at="$QWEN_ANCHOR_TOKENS" \
+      'BEGIN { v = a + r*(t-at); if (v < 0) v = 0; printf "%d", v }')
+    frac=$(awk -v p="$projected" -v c="$QWEN_PERSISTED_CEILW" 'BEGIN { print (c>0) ? p/c : 0 }')
+    col=$(color_frac "$frac")
+    flag="$(exhausted_flag "$frac" "$QWEN_WALL_TEXT" "$QWEN_WALL_TS" "$QWEN_PERSISTED_TS")"
+    QWEN_L1="7d       ${col}$(bar "$frac")${C_RESET} ${col}$(fmt_num "$projected") / $(fmt_num "$QWEN_PERSISTED_CEILW")${C_RESET}   ${C_DIM}reset $(epoch_local "$((QWEN_PERSISTED_P1WR / 1000))")${C_RESET}"
+    QWEN_L1+="  ${C_DIM}~est${C_RESET}"
+    [ -n "$flag" ] && QWEN_L1+="  $flag"
+    if [[ "$QWEN_PERSISTED_CEIL5" =~ ^[0-9]+$ ]] && [ "$QWEN_PERSISTED_CEIL5" -gt 0 ]; then
+      local est5 frac5
+      est5=$(awk -v r="$QWEN_RATE" -v t="$QWEN_MTR_T5" 'BEGIN { v = r*t; printf "%d", v }')
+      frac5=$(awk -v p="$est5" -v c="$QWEN_PERSISTED_CEIL5" 'BEGIN { print (c>0) ? p/c : 0 }')
+      col=$(color_frac "$frac5")
+      QWEN_L2="5h       ${col}$(bar "$frac5")${C_RESET} ${col}$(fmt_num "$est5") / $(fmt_num "$QWEN_PERSISTED_CEIL5")${C_RESET}"
+    fi
+    return
+  fi
+
+  # State 3 — no calibration, but a last gateway reading still within its
+  # window: dimmed real numbers with the age instead of an invented estimate.
+  if [ -n "$QWEN_PERSISTED_P1W" ] && [ -n "$QWEN_PERSISTED_CEILW" ] && [ -n "$QWEN_PERSISTED_P1WR" ] &&
+     [ "$QWEN_PERSISTED_TS" -gt 0 ] && [ "$now" -le "$((QWEN_PERSISTED_P1WR / 1000))" ]; then
+    age=$((now - QWEN_PERSISTED_TS))
+    [ "$age" -lt 0 ] && age=0
+    qwen_render_rows "$QWEN_PERSISTED_P1W" "$QWEN_PERSISTED_P1WR" "$QWEN_PERSISTED_P5" "$QWEN_PERSISTED_P5R" "$QWEN_PERSISTED_CEILW" "$QWEN_PERSISTED_CEIL5" 1 "$(fmt_age "$age")" "$QWEN_PERSISTED_TS"
+    return
+  fi
+
+  # State 4 — nothing usable; render unavailable like the other providers.
+  # The meter never renders as a token count.
+  QWEN_L1='7d       unavailable'
+  flag="$(exhausted_flag 0 "$QWEN_WALL_TEXT")"
+  [ -n "$flag" ] && QWEN_L1+="  $flag"
+}
+
+fetch_all() {
+  local auth='' codex_access codex_account
+  local body frac col
+  local pct reset_at now
+  local codex_file codex_body=''
+  local -a pids=()
+  local grok_access grok_file grok_body=''
+  load_roles
+  GPT_WEEK='7d       unavailable'
+  GROK_WEEK='7d       unavailable'
+  refresh_xai_auth
+  [ -r "$AUTH_FILE" ] && auth=$(cat "$AUTH_FILE" 2>/dev/null || true)
+  now=$(now_epoch)
+
+  codex_access=$(jq -r '."openai-codex".oauth.access // ."openai-codex".access // empty' <<<"$auth" 2>/dev/null || true)
+  codex_account=$(jq -r '."openai-codex".oauth.accountId // ."openai-codex".accountId // empty' <<<"$auth" 2>/dev/null || true)
+  grok_access=$(jq -r '.xai.oauth.access // .xai.access // empty' <<<"$auth" 2>/dev/null || true)
+
+  if [ -n "$TELEMETRY_TMP" ]; then
+    codex_file="$TELEMETRY_TMP/codex.json"
+    grok_file="$TELEMETRY_TMP/grok.json"
+    : >"$codex_file"
+    : >"$grok_file"
+    if [ -n "$codex_access" ] && [ -n "$codex_account" ]; then
+      api_get 'https://chatgpt.com/backend-api/wham/usage' \
+        -H "Authorization: Bearer $codex_access" -H "ChatGPT-Account-Id: $codex_account" >"$codex_file" &
+      pids+=($!)
+    fi
+    if [ -n "$grok_access" ]; then
+      api_get 'https://cli-chat-proxy.grok.com/v1/billing?format=credits' \
+        -H "Authorization: Bearer $grok_access" >"$grok_file" &
+      pids+=($!)
+    fi
+    if [ "${#pids[@]}" -gt 0 ]; then wait "${pids[@]}"; fi
+    codex_body=$(cat "$codex_file" 2>/dev/null || true)
+    grok_body=$(cat "$grok_file" 2>/dev/null || true)
+  else
+    if [ -n "$codex_access" ] && [ -n "$codex_account" ]; then
+      codex_body=$(api_get 'https://chatgpt.com/backend-api/wham/usage' \
+        -H "Authorization: Bearer $codex_access" -H "ChatGPT-Account-Id: $codex_account")
+    fi
+    if [ -n "$grok_access" ]; then
+      grok_body=$(api_get 'https://cli-chat-proxy.grok.com/v1/billing?format=credits' \
+        -H "Authorization: Bearer $grok_access")
+    fi
+  fi
+
+  if [ -n "$codex_body" ]; then
+    body="$codex_body"
+    pct=$(jq -r '.rate_limit.primary_window.used_percent // empty' <<<"$body" 2>/dev/null || true)
+    reset_at=$(jq -r '.rate_limit.primary_window.reset_at // empty' <<<"$body" 2>/dev/null || true)
+    if [[ "$pct" =~ ^[0-9]+([.][0-9]+)?$ && "$reset_at" =~ ^[0-9]+$ ]]; then
+      frac=$(awk -v p="$pct" 'BEGIN { print p/100 }')
+      col=$(color_frac "$frac")
+      GPT_WEEK="7d       ${col}$(bar "$frac")${C_RESET} ${col}${pct}%${C_RESET}   ${C_DIM}reset $(epoch_local "$reset_at")${C_RESET}"
+    fi
+  fi
+
+  if [ -n "$grok_body" ]; then
+    body="$grok_body"
+    pct=$(jq -r '.config.creditUsagePercent // empty' <<<"$body" 2>/dev/null || true)
+    reset_at=$(jq -r '.config.currentPeriod.end // .config.billingPeriodEnd // empty' <<<"$body" 2>/dev/null || true)
+    if [[ "$pct" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      frac=$(awk -v p="$pct" 'BEGIN { print p/100 }')
+      col=$(color_frac "$frac")
+      GROK_WEEK="7d       ${col}$(bar "$frac")${C_RESET} ${col}${pct}%${C_RESET}"
+      if [ -n "$reset_at" ] && [ "$reset_at" != null ]; then
+        GROK_WEEK+="   ${C_DIM}reset $(iso_local "$reset_at")${C_RESET}"
+      fi
+    fi
+  fi
+
+  qwen_update "$now"
+  return 0
+}
+
+render() {
+  local frame
+  frame=$(render_body)
+  if [ -t 1 ]; then printf '\033[2J\033[H'; fi
+  printf '%s\n' "$frame"
+  # Persist the frame so the next launch can paint it instantly while the
+  # live fetch runs. Panel output carries no credential material.
+  mkdir -p -- "$(dirname -- "$FRAME_FILE")" 2>/dev/null || true
+  printf '%s\n' "$frame" >"$FRAME_FILE" 2>/dev/null || true
+  chmod 600 "$FRAME_FILE" 2>/dev/null || true
+}
+
+render_body() {
+  local sep="${C_DIM} ─────────────────────────────────────────────────────────────────────────────────────────────${C_RESET}"
+  printf '%s\n' "${C_BOLD} QQ DASHBOARD${C_RESET}  ${C_DIM}updated $(date '+%H:%M:%S %Z')${C_RESET}"
+  printf '%s\n' "$sep"
+  printf '%s\n' "${C_BOLD} Codex${C_RESET}"
+  printf '   %s\n' "$(row_or_dim "$GPT_WEEK")"
+  printf '%s\n' ''
+  printf '%s\n' "${C_BOLD} Grok${C_RESET}"
+  printf '   %s\n' "$(row_or_dim "$GROK_WEEK")"
+  printf '%s\n' ''
+  printf '%s\n' "${C_BOLD} Qwen${C_RESET}"
+  [ -n "$QWEN_L1" ] && printf '   %s\n' "$(row_or_dim "$QWEN_L1")"
+  [ -n "$QWEN_L2" ] && printf '   %s\n' "$(row_or_dim "$QWEN_L2")"
+  printf '%s\n' ''
+  printf '%s\n' ''
+  printf '%s\n' "${C_BOLD} Execution profiles${C_RESET}"
+  [ -n "$ROLES_BODY" ] && printf '%s\n' "$(row_or_dim "$ROLES_BODY")"
+  printf '%s\n' "$sep"
+  printf '%s\n' "${C_DIM}r refresh · q quit · auto ${REFRESH_SECS}s · Qwen ping ${QWEN_GW_CADENCE}s${C_RESET}"
+}
+
+qq_dashboard_main() {
+  case "${1:-}" in
+    '') ONCE=0 ;;
+    --once) ONCE=1 ;;
+    --help|-h) usage; return 0 ;;
+    *) usage >&2; return 2 ;;
+  esac
+  [ "$#" -le 1 ] || { usage >&2; return 2; }
+  if [ -z "$TELEMETRY_HOME" ] || [[ "$TELEMETRY_HOME" != /* ]]; then
+    printf 'qq-dashboard: HOME must be absolute\n' >&2
+    return 65
+  fi
+
+  if [ "$ONCE" = 1 ]; then
+    fetch_all || return 65
+    render
+    return 0
+  fi
+
+  # Paint the last persisted frame immediately so the pane is never blank
+  # while the first live fetch runs; the fetch then repaints over it.
+  if [ -s "$FRAME_FILE" ]; then
+    cat -- "$FRAME_FILE"
+    printf '%s\n' "${C_DIM}stale frame — refreshing…${C_RESET}"
+  fi
+
+  while true; do
+    fetch_all || return 65
+    render
+    key=''
+    if [ -t 0 ]; then
+      read -r -t "$REFRESH_SECS" -n1 key || key=''
+    else
+      sleep "$REFRESH_SECS"
+    fi
+    case "$key" in
+      q|Q) [ -t 1 ] && printf '\033[2J\033[H'; return 0 ;;
+      r|R) FORCE_QWEN=1 ;;
+    esac
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  qq_dashboard_main "$@"
+fi

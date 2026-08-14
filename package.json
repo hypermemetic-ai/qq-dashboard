@@ -1,0 +1,13 @@
+{
+  "name": "@hypermemetic-ai/qq-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "qq-dashboard": "bin/qq-dashboard",
+    "qq-dashboard-cookies": "bin/qq-dashboard-cookies"
+  },
+  "scripts": {
+    "test": "tests/test-dashboard.sh"
+  }
+}

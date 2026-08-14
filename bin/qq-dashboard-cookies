@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# Gated Firefox-to-Qwen cookie refresh for the QQ dashboard.
+set -u
+
+COOKIE_SCRIPT_PATH=$(realpath -e -- "${BASH_SOURCE[0]}") || exit 1
+COOKIE_SCRIPT_DIR=$(cd -- "$(dirname -- "$COOKIE_SCRIPT_PATH")" && pwd)
+# shellcheck source=bin/lib/telemetry-lib.sh
+source "$COOKIE_SCRIPT_DIR/lib/telemetry-lib.sh"
+
+TELEMETRY_STATE_DIR="${HOME}/.local/state/qq/telemetry"
+COOKIE_FILE="$TELEMETRY_STATE_DIR/qwen.cookies"
+VENV_DIR="$TELEMETRY_STATE_DIR/venv"
+BROWSER_COOKIE_VERSION='0.19.1'
+
+cookies_usage() {
+  cat <<'EOF'
+Usage: qq-dashboard-cookies <refresh|status|validate> [--help]
+
+Manage the local qwencloud.com browser-cookie snapshot used by qq-dashboard.
+  refresh   Inventory cookie names, ask for confirmation, write the mode-600
+            snapshot, then validate it with a full gateway round-trip.
+  status    Report snapshot metadata, domain counts, and a current gateway
+            round-trip result. Cookie values are never shown.
+  validate  Run the gateway round-trip and print provider usage metadata.
+EOF
+}
+
+refresh_usage() {
+  cat <<'EOF'
+Usage: qq-dashboard-cookies refresh [--help]
+
+Read only qwencloud.com rows from Firefox, list names and counts, prompt for an
+explicit y, write the fixed local snapshot path at mode 600, then validate it.
+EOF
+}
+
+status_usage() {
+  cat <<'EOF'
+Usage: qq-dashboard-cookies status [--help]
+
+Report cookie snapshot existence, age, byte count, qwencloud.com domain counts,
+and the result of a current gateway round-trip. No cookie values are shown.
+EOF
+}
+
+validate_usage() {
+  cat <<'EOF'
+Usage: qq-dashboard-cookies validate [--help]
+
+Use the fixed local cookie snapshot for the Qwen console-gateway usage,
+quota-config, and subscription round-trip. No cookie or token values are shown.
+EOF
+}
+
+ensure_venv() {
+  mkdir -p -- "$TELEMETRY_STATE_DIR" || return 1
+  if [ ! -x "$VENV_DIR/bin/python" ]; then
+    python3 -m venv "$VENV_DIR" || return 1
+  fi
+  if ! "$VENV_DIR/bin/python" - "$BROWSER_COOKIE_VERSION" <<'PY' >/dev/null 2>&1
+import importlib.metadata
+import sys
+try:
+    installed = importlib.metadata.version("browser-cookie3")
+except importlib.metadata.PackageNotFoundError:
+    raise SystemExit(1)
+raise SystemExit(0 if installed == sys.argv[1] else 1)
+PY
+  then
+    "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check --quiet \
+      "browser_cookie3==$BROWSER_COOKIE_VERSION" || return 1
+  fi
+}
+
+discover_firefox_profile() {
+  local home_real profile profile_real
+  local -a profiles=()
+  home_real=$(realpath -e -- "$HOME") || return 1
+  while IFS= read -r -d '' profile; do profiles+=("$profile"); done \
+    < <(find "$HOME/.config/mozilla/firefox" -mindepth 1 -maxdepth 1 -type d \
+      -name '*.default-release' -print0 2>/dev/null)
+  if [ "${#profiles[@]}" -eq 0 ]; then
+    printf 'Firefox default-release profile: unavailable\n' >&2
+    return 1
+  fi
+  if [ "${#profiles[@]}" -gt 1 ]; then
+    printf 'Firefox default-release profile: ambiguous (%d profiles)\n' "${#profiles[@]}" >&2
+    return 1
+  fi
+  profile_real=$(realpath -e -- "${profiles[0]}") || return 1
+  case "$profile_real/" in
+    "$home_real"/*) ;;
+    *) printf 'Refusing Firefox profile outside HOME.\n' >&2; return 1 ;;
+  esac
+  if [ ! -f "$profile_real/cookies.sqlite" ]; then
+    printf 'Firefox cookie database: unavailable\n' >&2
+    return 1
+  fi
+  printf '%s' "$profile_real"
+}
+
+browser_cookie_helper() {
+  local action="$1" profile="$2"
+  "$VENV_DIR/bin/python" - "$action" "$profile" "$COOKIE_FILE" <<'PY'
+from __future__ import annotations
+
+from collections import Counter
+from pathlib import Path
+import os
+import re
+import stat
+import sys
+
+import browser_cookie3
+
+action, profile_arg, target_arg = sys.argv[1:]
+profile = Path(profile_arg).resolve(strict=True)
+home_path = Path.home()
+home_real = home_path.resolve(strict=True)
+requested_target = Path(target_arg)
+requested_expected = home_path / ".local" / "state" / "qq" / "telemetry" / "qwen.cookies"
+target = home_real / ".local" / "state" / "qq" / "telemetry" / "qwen.cookies"
+
+try:
+    profile.relative_to(home_real)
+except ValueError:
+    raise SystemExit("Refusing Firefox profile outside HOME.")
+if requested_target != requested_expected:
+    raise SystemExit("Refusing cookie output path other than the telemetry snapshot.")
+
+def allowed_domain(domain: str) -> bool:
+    normalized = domain.lstrip(".").lower()
+    return normalized == "qwencloud.com" or normalized.endswith(".qwencloud.com")
+
+jar = browser_cookie3.firefox(
+    cookie_file=str(profile / "cookies.sqlite"), domain_name="qwencloud.com"
+)
+cookies = list(jar)
+if any(not allowed_domain(cookie.domain) for cookie in cookies):
+    raise SystemExit("Refusing non-qwencloud.com cookie rows.")
+if not cookies:
+    raise SystemExit("No qwencloud.com cookie rows found.")
+
+safe_name = re.compile(r"^[A-Za-z0-9_.-]+$")
+for cookie in cookies:
+    if not safe_name.fullmatch(cookie.name):
+        raise SystemExit("Refusing a cookie row with an unsafe name.")
+    fields = (cookie.domain, cookie.path or "/", cookie.name, cookie.value)
+    if any("\t" in field or "\r" in field or "\n" in field for field in fields):
+        raise SystemExit("Refusing a malformed cookie row.")
+
+if action == "inventory":
+    domains = Counter(cookie.domain.lower() for cookie in cookies)
+    names = Counter(cookie.name for cookie in cookies)
+    print(f"cookie rows: {len(cookies)}")
+    print("domains:")
+    for domain, count in sorted(domains.items()):
+        print(f"  {domain}: {count}")
+    print("names:")
+    for name, count in sorted(names.items()):
+        print(f"  {name}: {count}")
+    raise SystemExit(0)
+
+if action != "write":
+    raise SystemExit("Unknown browser-cookie helper action.")
+
+header = b"# Netscape HTTP Cookie File\n"
+marker = b"# qwencloud.com rows for qq telemetry; values intentionally never displayed\n"
+parent_flags = os.O_RDONLY
+if hasattr(os, "O_DIRECTORY"):
+    parent_flags |= os.O_DIRECTORY
+if hasattr(os, "O_NOFOLLOW"):
+    parent_flags |= os.O_NOFOLLOW
+try:
+    parent_fd = os.open(home_real, parent_flags)
+except OSError:
+    raise SystemExit("Refusing a missing or invalid telemetry state directory.")
+fd = None
+try:
+    # Validate every fixed state-path component immediately before opening the
+    # snapshot. Descriptor-relative, no-follow traversal also keeps a racing
+    # ancestor replacement from redirecting the final file open.
+    for component in (".local", "state", "qq", "telemetry"):
+        try:
+            component_metadata = os.lstat(component, dir_fd=parent_fd)
+        except OSError:
+            raise SystemExit("Refusing a missing or invalid telemetry state directory.")
+        if stat.S_ISLNK(component_metadata.st_mode):
+            raise SystemExit("Refusing a symlink telemetry state directory.")
+        if not stat.S_ISDIR(component_metadata.st_mode):
+            raise SystemExit("Refusing a missing or invalid telemetry state directory.")
+        try:
+            next_parent_fd = os.open(component, parent_flags, dir_fd=parent_fd)
+        except OSError:
+            raise SystemExit("Refusing a missing or invalid telemetry state directory.")
+        opened_metadata = os.fstat(next_parent_fd)
+        if (
+            not stat.S_ISDIR(opened_metadata.st_mode)
+            or opened_metadata.st_dev != component_metadata.st_dev
+            or opened_metadata.st_ino != component_metadata.st_ino
+        ):
+            os.close(next_parent_fd)
+            raise SystemExit("Refusing a changed telemetry state directory.")
+        os.close(parent_fd)
+        parent_fd = next_parent_fd
+
+    try:
+        snapshot_metadata = os.stat(
+            target.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+    except FileNotFoundError:
+        snapshot_metadata = None
+    except OSError:
+        raise SystemExit("Refusing an invalid cookie snapshot.")
+    if snapshot_metadata is not None and stat.S_ISLNK(snapshot_metadata.st_mode):
+        raise SystemExit("Refusing to overwrite a symlink cookie snapshot.")
+
+    target_flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        target_flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(
+            target.name,
+            target_flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        existing = False
+    except FileExistsError:
+        try:
+            fd = os.open(target.name, target_flags, dir_fd=parent_fd)
+        except OSError:
+            raise SystemExit("Refusing an invalid cookie snapshot.")
+        existing = True
+    except OSError:
+        raise SystemExit("Refusing an invalid cookie snapshot.")
+
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise SystemExit("Refusing to overwrite a cookie snapshot not owned by this user.")
+    if existing:
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.read(fd, len(header) + len(marker)) != header + marker:
+            raise SystemExit("Refusing to overwrite a non-telemetry snapshot file.")
+
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n", closefd=False) as stream:
+        stream.write(header.decode("ascii"))
+        stream.write(marker.decode("ascii"))
+        for cookie in sorted(cookies, key=lambda row: (row.domain, row.path, row.name)):
+            include_subdomains = "TRUE" if cookie.domain.startswith(".") else "FALSE"
+            secure = "TRUE" if cookie.secure else "FALSE"
+            expires = int(cookie.expires or 0)
+            stream.write("\t".join((
+                cookie.domain,
+                include_subdomains,
+                cookie.path or "/",
+                secure,
+                str(expires),
+                cookie.name,
+                cookie.value,
+            )) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+finally:
+    if fd is not None:
+        os.close(fd)
+    os.close(parent_fd)
+print(f"cookie snapshot written: {len(cookies)} rows (mode 600)")
+PY
+}
+
+cookie_domain_status() {
+  python3 - "$COOKIE_FILE" <<'PY'
+from collections import Counter
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+counts = Counter()
+malformed = 0
+try:
+    stream = path.open("r", encoding="utf-8")
+except OSError:
+    print("cookie domains: unavailable")
+    raise SystemExit(0)
+with stream:
+    for raw in stream:
+        line = raw.rstrip("\r\n")
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            malformed += 1
+            continue
+        domain = fields[0].lower()
+        normalized = domain.lstrip(".")
+        if normalized == "qwencloud.com" or normalized.endswith(".qwencloud.com"):
+            counts[domain] += 1
+        else:
+            malformed += 1
+if counts:
+    print("cookie domains: " + ", ".join(
+        f"{domain}={count}" for domain, count in sorted(counts.items())
+    ))
+else:
+    print("cookie domains: unavailable")
+if malformed:
+    print(f"refused/malformed domain rows: {malformed}")
+PY
+}
+
+GATEWAY_SPEC=''
+GATEWAY_WEEKLY=''
+GATEWAY_RESET=''
+GATEWAY_WEEKLY_CEILING=''
+GATEWAY_5H_CEILING=''
+
+gateway_roundtrip() {
+  local tmp sec endpoint
+  [ -f "$COOKIE_FILE" ] || return 1
+  [ ! -L "$COOKIE_FILE" ] || return 1
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/qq-dashboard-cookies.XXXXXX") || return 1
+  sec=$(curl -sS -L -m 12 -b "$COOKIE_FILE" \
+    'https://home.qwencloud.com/tool/user/info.json' 2>/dev/null |
+    jq -r '.data.secToken // empty' 2>/dev/null || true)
+  if [ -z "$sec" ]; then
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  for endpoint in usage quota-config subscription; do
+    if ! curl -sS -L -m 12 -X POST 'https://cs-data.qwencloud.com/data/api.json' \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      -H 'Origin: https://home.qwencloud.com' \
+      -H 'Referer: https://home.qwencloud.com/billing/subscription/token-plan-individual' \
+      -b "$COOKIE_FILE" \
+      --data-urlencode 'product=sfm_bailian' \
+      --data-urlencode 'action=IntlBroadScopeAspnGateway' \
+      --data-urlencode "sec_token=$sec" \
+      --data-urlencode 'region=ap-southeast-1' \
+      --data-urlencode "params={\"Api\":\"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/$endpoint\",\"Data\":{\"cornerstoneParam\":{\"domain\":\"home.qwencloud.com\",\"consoleSite\":\"QWENCLOUD\",\"console\":\"ONE_CONSOLE\",\"xsp_lang\":\"en-US\",\"protocol\":\"V2\",\"productCode\":\"p_efm\"}},\"V\":\"1.0\"}" \
+      >"$tmp/$endpoint" 2>/dev/null; then
+      rm -rf -- "$tmp"
+      return 1
+    fi
+    if ! jq -e '.data.DataV2.data.data != null' "$tmp/$endpoint" >/dev/null 2>&1; then
+      rm -rf -- "$tmp"
+      return 1
+    fi
+  done
+
+  GATEWAY_SPEC=$(jq -r '.data.DataV2.data.data.specCode // empty' "$tmp/subscription" 2>/dev/null || true)
+  GATEWAY_WEEKLY=$(jq -r '.data.DataV2.data.data.per1WeekPercentage // empty' "$tmp/usage" 2>/dev/null || true)
+  GATEWAY_RESET=$(jq -r '.data.DataV2.data.data.per1WeekResetTime // empty' "$tmp/usage" 2>/dev/null || true)
+  GATEWAY_WEEKLY_CEILING=$(tier_ceiling "$(cat "$tmp/quota-config")" "$GATEWAY_SPEC" weekly || true)
+  GATEWAY_5H_CEILING=$(tier_ceiling "$(cat "$tmp/quota-config")" "$GATEWAY_SPEC" five_hour || true)
+  rm -rf -- "$tmp"
+
+  [ -n "$GATEWAY_SPEC" ] &&
+    [[ "$GATEWAY_WEEKLY" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+    { [[ "$GATEWAY_RESET" =~ ^[0-9]+$ ]] ||
+      [ "$(awk -v p="$GATEWAY_WEEKLY" 'BEGIN { print (p==0) ? 1 : 0 }')" = 1 ]; } &&
+    [[ "$GATEWAY_WEEKLY_CEILING" =~ ^[0-9]+$ ]] &&
+    [[ "$GATEWAY_5H_CEILING" =~ ^[0-9]+$ ]]
+}
+
+print_gateway_summary() {
+  local weekly_percent reset_text
+  weekly_percent=$(awk -v fraction="$GATEWAY_WEEKLY" 'BEGIN { printf "%.1f", fraction*100 }')
+  if [[ "$GATEWAY_RESET" =~ ^[0-9]+$ ]]; then
+    reset_text=$(date -d "@$((GATEWAY_RESET / 1000))" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || printf 'unavailable')
+  else
+    reset_text='window not started'
+  fi
+  printf 'gateway round-trip: ok\n'
+  printf 'specCode: %s\n' "$GATEWAY_SPEC"
+  printf 'weekly usage: %s%%\n' "$weekly_percent"
+  printf 'weekly reset: %s\n' "$reset_text"
+  printf 'tier ceilings: weekly %s; five_hour %s\n' \
+    "$(fmt_num "$GATEWAY_WEEKLY_CEILING")" "$(fmt_num "$GATEWAY_5H_CEILING")"
+}
+
+command_validate() {
+  if gateway_roundtrip; then
+    print_gateway_summary
+    return 0
+  fi
+  printf 'gateway round-trip: unavailable\n' >&2
+  return 1
+}
+
+command_status() {
+  local now mtime age bytes mode owner
+  if [ ! -e "$COOKIE_FILE" ]; then
+    printf 'cookie file: absent\n'
+    printf 'cookie domains: unavailable\n'
+    printf 'gateway round-trip: unavailable (cookie file absent)\n'
+    return 0
+  fi
+  if [ -L "$COOKIE_FILE" ] || [ ! -f "$COOKIE_FILE" ]; then
+    printf 'cookie file: refused (not a regular owned snapshot)\n'
+    printf 'cookie domains: unavailable\n'
+    printf 'gateway round-trip: unavailable\n'
+    return 0
+  fi
+  owner=$(stat -c '%u' -- "$COOKIE_FILE" 2>/dev/null || printf '?')
+  if [ "$owner" != "$(id -u)" ]; then
+    printf 'cookie file: refused (wrong owner)\n'
+    printf 'cookie domains: unavailable\n'
+    printf 'gateway round-trip: unavailable\n'
+    return 0
+  fi
+  now=$(date +%s)
+  mtime=$(stat -c '%Y' -- "$COOKIE_FILE")
+  bytes=$(stat -c '%s' -- "$COOKIE_FILE")
+  mode=$(stat -c '%a' -- "$COOKIE_FILE")
+  age=$((now - mtime))
+  [ "$age" -lt 0 ] && age=0
+  printf 'cookie file: present; age %ss; bytes %s; mode %s\n' "$age" "$bytes" "$mode"
+  cookie_domain_status
+  if gateway_roundtrip; then
+    printf 'gateway round-trip: ok (checked now)\n'
+  else
+    printf 'gateway round-trip: unavailable (checked now)\n'
+  fi
+  return 0
+}
+
+command_refresh() {
+  local profile answer
+  ensure_venv || { printf 'Unable to bootstrap the pinned cookie helper.\n' >&2; return 1; }
+  profile=$(discover_firefox_profile) || return 1
+  printf 'Dry run — qwencloud.com cookie inventory (names and counts only):\n'
+  browser_cookie_helper inventory "$profile" || return 1
+  printf 'continue? [y/N] '
+  IFS= read -r answer || answer=''
+  case "$answer" in
+    y|Y) ;;
+    *) printf 'Refresh cancelled; cookie file unchanged.\n'; return 0 ;;
+  esac
+  browser_cookie_helper write "$profile" || return 1
+  command_validate
+}
+
+qq_telemetry_cookies_main() {
+  local command="${1:-}"
+  case "$command" in
+    ''|--help|-h) cookies_usage; return 0 ;;
+    refresh|status|validate)
+      if [ "$#" -gt 2 ]; then cookies_usage >&2; return 2; fi
+      if [ "${2:-}" = '--help' ] || [ "${2:-}" = '-h' ]; then
+        "${command}_usage"
+        return 0
+      fi
+      if [ "$#" -gt 1 ]; then "${command}_usage" >&2; return 2; fi
+      "command_${command}"
+      ;;
+    *) cookies_usage >&2; return 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  qq_telemetry_cookies_main "$@"
+fi
