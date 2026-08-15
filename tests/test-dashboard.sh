@@ -132,7 +132,7 @@ mkdir -p "$TMP/provider-home/.pi/agent"
 cat >"$TMP/provider-home/.pi/agent/auth.json" <<'JSON'
 {
   "openai-codex": {"access":"codex-access","accountId":"codex-account"},
-  "xai": {"access":"grok-access"}
+  "xai-auth": {"access":"grok-access"}
 }
 JSON
 provider_frame=$(HOME="$TMP/provider-home" QQ_PROFILE_BIN="$TMP/fake-bin/profile-fail" \

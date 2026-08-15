@@ -49,9 +49,10 @@ api_get() {
 }
 
 refresh_xai_auth() {
-  # Pi refreshes subscription OAuth credentials on use, but this panel reads
-  # auth.json directly. Refresh only when its stored xAI credential is due so
-  # the billing request does not fail with a stale bearer token.
+  # Pi refreshes the legacy built-in xai OAuth credential on use, but this
+  # panel reads auth.json directly. The xai-auth extension owns refresh for its
+  # subscription credential when Grok runs; the panel consumes that stored
+  # bearer below without taking over credential mutation.
   local nowms
   [ -r "$AUTH_FILE" ] || return 0
   nowms=$(( $(now_epoch) * 1000 ))
@@ -738,7 +739,7 @@ fetch_all() {
 
   codex_access=$(jq -r '."openai-codex".oauth.access // ."openai-codex".access // empty' <<<"$auth" 2>/dev/null || true)
   codex_account=$(jq -r '."openai-codex".oauth.accountId // ."openai-codex".accountId // empty' <<<"$auth" 2>/dev/null || true)
-  grok_access=$(jq -r '.xai.oauth.access // .xai.access // empty' <<<"$auth" 2>/dev/null || true)
+  grok_access=$(jq -r '."xai-auth".oauth.access // ."xai-auth".access // .xai.oauth.access // .xai.access // empty' <<<"$auth" 2>/dev/null || true)
 
   if [ -n "$TELEMETRY_TMP" ]; then
     codex_file="$TELEMETRY_TMP/codex.json"
