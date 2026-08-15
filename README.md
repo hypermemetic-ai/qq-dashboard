@@ -1,6 +1,6 @@
 # QQ Dashboard
 
-A private, QQ-specific terminal dashboard for operational information used when running agent methodology.
+A QQ-specific terminal dashboard for operational information used when running agent methodology.
 
 The first page shows:
 

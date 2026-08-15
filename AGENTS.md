@@ -1,6 +1,6 @@
 # qq-dashboard repository guidance
 
-`qq-dashboard` is a private, QQ-specific terminal dashboard. It is not a general-purpose telemetry framework.
+`qq-dashboard` is a QQ-specific terminal dashboard. Public source visibility does not make it a general-purpose telemetry framework.
 
 - Keep the dashboard read-only. QQ owns execution-profile policy and mutation.
 - Read execution profiles only through `qq-profile list --json`; do not import QQ source or read its private policy file directly.
