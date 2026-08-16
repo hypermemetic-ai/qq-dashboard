@@ -8,6 +8,6 @@
     "qq-dashboard-cookies": "bin/qq-dashboard-cookies"
   },
   "scripts": {
-    "test": "tests/test-dashboard.sh"
+    "test": "tests/test-dashboard.sh && tests/test-install.sh"
   }
 }
