@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-TMP=$(mktemp -d "$HOME/qq-dashboard-install-test.XXXXXX")
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/qq-dashboard-install-test.XXXXXX")
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
 chmod 700 "$TMP"
