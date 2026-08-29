@@ -1,6 +1,5 @@
 import { normalizeUsage, projectSnapshot } from "./snapshot.mjs";
 
-const DEFAULT_CATALOG_REFRESH_MS = 30_000;
 const DEFAULT_WORKFLOW_REFRESH_MS = 30_000;
 
 function optional(getter) {
@@ -19,67 +18,72 @@ function workflowRows(service) {
   }
 }
 
+function timestamp(now) {
+  const observed = now();
+  return Number.isFinite(observed) && observed >= 0 ? Math.floor(observed) : 0;
+}
+
 /**
- * Own the dependency reads outside the public snapshot() call. Full refreshes
- * include the optional workflow aggregate; lightweight timer ticks reuse those
- * rows between cadence refreshes. snapshot() is always one cached object read.
+ * Own asynchronous dependency reads outside public snapshot(). Refresh requests
+ * are serialized and coalesced, so slow core.list() calls cannot overlap or
+ * build an unbounded timer backlog. Each actual refresh reads the full agent
+ * forest once and active project chairs once.
  */
 export function createDashboardCache({
   core,
   workflows,
   now = Date.now,
-  catalogRefreshMs = DEFAULT_CATALOG_REFRESH_MS,
   workflowRefreshMs = DEFAULT_WORKFLOW_REFRESH_MS,
   usage,
 } = {}) {
-  if (!core || typeof core.listAgents !== "function" || typeof core.listProjects !== "function") {
-    throw new TypeError("qq-dashboard: qq-core listAgents/listProjects service is required");
+  if (!core || typeof core.listAgents !== "function" || typeof core.list !== "function") {
+    throw new TypeError("qq-dashboard: qq-core listAgents/list service is required");
   }
-  const initialNow = now();
-  const initialAt = Number.isFinite(initialNow) && initialNow >= 0 ? Math.floor(initialNow) : 0;
+  const initialAt = timestamp(now);
   const usageCache = normalizeUsage(usage, initialAt);
-  let catalog = [];
   let agents = [];
+  let projectRows = [];
   let workflowsCache = [];
-  let catalogObserved = false;
   let workflowObserved = false;
-  let lastCatalogAt = -Infinity;
   let lastWorkflowAt = -Infinity;
   let current = projectSnapshot({ generatedAt: initialAt, usage: usageCache });
+  let queued = false;
+  let queuedWorkflow = false;
+  let active = null;
 
-  function update({ refreshWorkflows }) {
-    const observedNow = now();
-    const at = Number.isFinite(observedNow) && observedNow >= 0 ? Math.floor(observedNow) : 0;
-    const cadence = Number.isFinite(catalogRefreshMs) && catalogRefreshMs >= 0
-      ? catalogRefreshMs
-      : DEFAULT_CATALOG_REFRESH_MS;
-    if (!catalogObserved || at - lastCatalogAt >= cadence) {
-      catalogObserved = true;
-      lastCatalogAt = at;
-      try {
-        const listed = core.listProjects();
-        if (Array.isArray(listed)) catalog = listed;
-      } catch {
-        // Keep the last complete catalog. Agent state can still refresh.
-      }
+  async function update({ refreshWorkflows }) {
+    const at = timestamp(now);
+
+    // Capture both core authorities as one pair. A transient or malformed read
+    // preserves the last complete pair instead of joining data from two times.
+    let nextAgents;
+    let nextProjectRows;
+    try {
+      nextAgents = core.listAgents();
+    } catch {
+      nextAgents = null;
     }
     try {
-      const listed = core.listAgents();
-      if (Array.isArray(listed)) agents = listed;
+      nextProjectRows = await core.list();
     } catch {
-      // Keep the last complete live catalog across a transient core failure.
+      nextProjectRows = null;
     }
-    const workflowCadence = Number.isFinite(workflowRefreshMs) && workflowRefreshMs >= 0
+    if (Array.isArray(nextAgents) && Array.isArray(nextProjectRows)) {
+      agents = nextAgents;
+      projectRows = nextProjectRows;
+    }
+
+    const cadence = Number.isFinite(workflowRefreshMs) && workflowRefreshMs >= 0
       ? workflowRefreshMs
       : DEFAULT_WORKFLOW_REFRESH_MS;
-    if (refreshWorkflows || !workflowObserved || at - lastWorkflowAt >= workflowCadence) {
+    if (refreshWorkflows || !workflowObserved || at - lastWorkflowAt >= cadence) {
       workflowObserved = true;
       lastWorkflowAt = at;
       workflowsCache = workflowRows(optional(workflows));
     }
     current = projectSnapshot({
       generatedAt: at,
-      projects: catalog,
+      projectRows,
       agents,
       workflowRows: workflowsCache,
       usage: usageCache,
@@ -87,12 +91,29 @@ export function createDashboardCache({
     return current;
   }
 
+  function schedule(refreshWorkflows) {
+    queued = true;
+    queuedWorkflow ||= refreshWorkflows;
+    if (!active) {
+      active = (async () => {
+        while (queued) {
+          const full = queuedWorkflow;
+          queued = false;
+          queuedWorkflow = false;
+          await update({ refreshWorkflows: full });
+        }
+        return current;
+      })().finally(() => { active = null; });
+    }
+    return active;
+  }
+
   function refresh() {
-    return update({ refreshWorkflows: true });
+    return schedule(true);
   }
 
   function tick() {
-    return update({ refreshWorkflows: false });
+    return schedule(false);
   }
 
   const service = Object.freeze({
@@ -100,11 +121,10 @@ export function createDashboardCache({
     snapshot() { return current; },
   });
 
-  refresh();
-  return Object.freeze({ service, refresh, tick });
+  const ready = refresh();
+  return Object.freeze({ service, refresh, tick, ready });
 }
 
 export const defaults = Object.freeze({
-  catalogRefreshMs: DEFAULT_CATALOG_REFRESH_MS,
   workflowRefreshMs: DEFAULT_WORKFLOW_REFRESH_MS,
 });

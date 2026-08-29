@@ -38,70 +38,35 @@ function compareAliases(left, right) {
     || compareText(left.id, right.id);
 }
 
-function normalizePath(value) {
-  const raw = text(value);
-  if (!raw.startsWith("/")) return "";
-  const parts = [];
-  for (const part of raw.split("/")) {
-    if (!part || part === ".") continue;
-    if (part === "..") parts.pop();
-    else parts.push(part);
-  }
-  return `/${parts.join("/")}`;
-}
-
 function projectKey(project, folder) {
-  // This encoding is stable but deliberately undocumented to consumers. Keys
-  // are equality identities; routes and labels use the explicit fields below.
+  // Stable equality identity only. Consumers must use explicit presentation and
+  // routing fields rather than interpreting this encoding.
   return `p:${encodeURIComponent(project)}:${encodeURIComponent(folder)}`;
 }
 
-function projectGroups(projects) {
-  if (!Array.isArray(projects)) return [];
-  const groups = [];
-  const keys = new Set();
-  for (const candidate of projects) {
+function normalizeProjectRows(projectRows) {
+  if (!Array.isArray(projectRows)) return [];
+  const rows = [];
+  const seenSessions = new Set();
+  for (const candidate of projectRows) {
     if (!candidate || typeof candidate !== "object") continue;
-    const name = text(candidate.name);
-    if (!name) continue;
-    const label = displayText(candidate.label) || displayText(name) || "project";
-    const folders = Array.isArray(candidate.folders) ? candidate.folders : [];
-    const grouped = candidate.grouped === true;
-    if (grouped) {
-      for (const candidateFolder of folders) {
-        if (!candidateFolder || typeof candidateFolder !== "object") continue;
-        const folder = text(candidateFolder.name);
-        const cwd = normalizePath(candidateFolder.cwd);
-        if (!folder || !cwd) continue;
-        const key = projectKey(name, folder);
-        if (keys.has(key)) continue;
-        keys.add(key);
-        groups.push({
-          key,
-          name,
-          label,
-          folder,
-          folderLabel: displayText(candidateFolder.label) || displayText(folder) || "folder",
-          cwd,
-        });
-      }
-      continue;
-    }
-    const cwd = normalizePath(candidate.cwd)
-      || normalizePath(folders.find((folder) => folder && typeof folder === "object")?.cwd);
-    if (!cwd) continue;
-    const key = projectKey(name, "");
-    if (keys.has(key)) continue;
-    keys.add(key);
-    groups.push({ key, name, label, folder: "", folderLabel: "", cwd });
+    const id = text(candidate.id);
+    const project = text(candidate.project);
+    if (!SESSION_ID.test(id) || !project || seenSessions.has(id)) continue;
+    seenSessions.add(id);
+    const folder = text(candidate.folder);
+    rows.push({
+      id,
+      key: projectKey(project, folder),
+      name: project,
+      label: displayText(candidate.projectLabel) || displayText(project) || "project",
+      folder,
+      folderLabel: folder
+        ? displayText(candidate.folderLabel) || displayText(folder) || "folder"
+        : "",
+    });
   }
-  return groups.sort((left, right) => (
-    compareText(left.label, right.label)
-    || compareText(left.name, right.name)
-    || compareText(left.folderLabel, right.folderLabel)
-    || compareText(left.folder, right.folder)
-    || compareText(left.key, right.key)
-  ));
+  return rows;
 }
 
 function normalizeAgents(agents) {
@@ -123,10 +88,6 @@ function normalizeAgents(agents) {
         ? Math.floor(candidate.idle_for_ms)
         : null,
       parent: SESSION_ID.test(parent) && parent !== id ? parent : "",
-      cwd: normalizePath(candidate.cwd),
-      project: text(candidate.project),
-      folder: text(candidate.folder),
-      scope: text(candidate.scope),
     });
   }
   return rows;
@@ -191,24 +152,12 @@ export function normalizeUsage(candidate, fallbackGeneratedAt = Date.now()) {
   return Object.freeze({ generatedAt, providers: Object.freeze(providers) });
 }
 
-function classify(row, groups, groupsByName) {
-  if (row.project) {
-    const candidates = groupsByName.get(row.project) ?? [];
-    const explicit = candidates.find((group) => group.folder === row.folder);
-    if (explicit) return explicit;
-    if (!row.folder && candidates.length === 1) return candidates[0];
-  }
-  return groups.find((group) => group.cwd === row.cwd) ?? null;
-}
-
 function sessionProjection(row, parentSessionId, depth, workflows) {
   const workflow = workflows.get(row.id);
-  const alias = row.alias;
-  const label = row.label || alias || "session";
   return Object.freeze({
     sessionId: row.id,
-    alias,
-    label,
+    alias: row.alias,
+    label: row.label || row.alias || "session",
     parentSessionId,
     depth,
     activity: row.status === "running" ? "working" : "idle",
@@ -219,25 +168,27 @@ function sessionProjection(row, parentSessionId, depth, workflows) {
   });
 }
 
+function compareGroups(left, right) {
+  return compareText(left.label, right.label)
+    || compareText(left.name, right.name)
+    || compareText(left.folderLabel, right.folderLabel)
+    || compareText(left.folder, right.folder)
+    || compareText(left.key, right.key);
+}
+
 /**
- * Build qq.dashboard/v1 from already captured dependency rows. This function
- * performs no I/O and does not infer workflow semantics from labels or prose.
+ * Build qq.dashboard/v1 from already captured dependency rows. `projectRows`
+ * must be the authoritative active project-chair projection from qq-core.list().
+ * Agent cwd, worktree paths, labels and prose are never grouping authorities.
  */
 export function projectSnapshot({
   generatedAt = Date.now(),
-  projects = [],
+  projectRows = [],
   agents = [],
   workflowRows = [],
   usage,
 } = {}) {
   const at = epoch(generatedAt) ?? 0;
-  const groups = projectGroups(projects);
-  const groupsByName = new Map();
-  for (const group of groups) {
-    const matches = groupsByName.get(group.name) ?? [];
-    matches.push(group);
-    groupsByName.set(group.name, matches);
-  }
   const rows = normalizeAgents(agents);
   const byId = new Map(rows.map((row) => [row.id, row]));
   const children = new Map();
@@ -249,8 +200,36 @@ export function projectSnapshot({
   }
   for (const siblings of children.values()) siblings.sort(compareAliases);
 
-  const semanticWorkflows = workflowMap(workflowRows);
+  // qq-core.list() describes chairs. Only IDs that are roots of this captured
+  // live forest may seed a group; a child can only inherit its root's group.
+  const roots = children.get("") ?? [];
+  const rootIds = new Set(roots.map((row) => row.id));
+  const assignments = normalizeProjectRows(projectRows)
+    .filter((row) => rootIds.has(row.id));
+  const assignmentByRoot = new Map(assignments.map((row) => [row.id, row]));
+  const groupsByKey = new Map();
+  for (const assignment of assignments) {
+    const existing = groupsByKey.get(assignment.key);
+    if (!existing) {
+      groupsByKey.set(assignment.key, {
+        key: assignment.key,
+        name: assignment.name,
+        label: assignment.label,
+        folder: assignment.folder,
+        folderLabel: assignment.folderLabel,
+      });
+      continue;
+    }
+    // If malformed authority rows disagree on labels for one identity, choose a
+    // deterministic safe presentation rather than depending on input order.
+    if (compareText(assignment.label, existing.label) < 0) existing.label = assignment.label;
+    if (compareText(assignment.folderLabel, existing.folderLabel) < 0) {
+      existing.folderLabel = assignment.folderLabel;
+    }
+  }
+  const groups = [...groupsByKey.values()].sort(compareGroups);
   const sessionsByKey = new Map(groups.map((group) => [group.key, []]));
+  const semanticWorkflows = workflowMap(workflowRows);
   const visited = new Set();
 
   const excludeSubtree = (row) => {
@@ -260,35 +239,36 @@ export function projectSnapshot({
   };
   const walk = (row, group, depth, parentSessionId) => {
     if (visited.has(row.id)) return;
-    // The reserved Projects chair and everything below it are system topology,
-    // not an operator project group.
-    if (row.alias === "projects" || row.scope === "projects") {
+    // Reserved Projects topology is never an operator project, even if a
+    // malformed authority row accidentally assigns it one.
+    if (row.alias === "projects") {
       excludeSubtree(row);
       return;
     }
     visited.add(row.id);
-    if (group) {
-      sessionsByKey.get(group.key).push(sessionProjection(
-        row,
-        parentSessionId,
-        depth,
-        semanticWorkflows,
-      ));
+    if (!group) {
+      excludeSubtree(row);
+      return;
     }
+    sessionsByKey.get(group.key).push(sessionProjection(
+      row,
+      parentSessionId,
+      depth,
+      semanticWorkflows,
+    ));
     for (const child of children.get(row.id) ?? []) {
-      walk(child, group, depth + 1, group ? row.id : "");
+      walk(child, group, depth + 1, row.id);
     }
   };
 
-  const roots = children.get("") ?? [];
-  for (const root of roots) walk(root, classify(root, groups, groupsByName), 0, "");
-  // Malformed cycles are degraded deterministically instead of disappearing or
-  // recursing forever. The selected row becomes a topology root.
+  for (const root of roots) walk(root, assignmentByRoot.get(root.id) ?? null, 0, "");
+  // Cycles contain no top-level root and therefore no authoritative root join;
+  // omit them deterministically along with all other projectless/system rows.
   for (const row of rows.slice().sort(compareAliases)) {
-    if (!visited.has(row.id)) walk(row, classify(row, groups, groupsByName), 0, "");
+    if (!visited.has(row.id)) excludeSubtree(row);
   }
 
-  const activeProjects = groups.flatMap((group) => {
+  const projects = groups.flatMap((group) => {
     const sessions = sessionsByKey.get(group.key);
     if (!sessions?.length) return [];
     return [Object.freeze({
@@ -304,7 +284,7 @@ export function projectSnapshot({
   return Object.freeze({
     schema: DASHBOARD_SCHEMA,
     generatedAt: at,
-    projects: Object.freeze(activeProjects),
+    projects: Object.freeze(projects),
     usage: normalizeUsage(usage, at),
   });
 }

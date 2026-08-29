@@ -9,7 +9,7 @@ happening right now**. It has two compatible surfaces:
   execution profiles.
 
 The service projects existing authorities. `qq-core` remains authoritative for
-live identity, status, topology, and project catalog rows. `qq-workflows`
+live identity, status, topology, and active project-chair rows. `qq-workflows`
 remains authoritative for architect semantic phase and phase start time. The
 dashboard does not infer phase from labels, case prose, sidecars, or elapsed
 poll observations.
@@ -60,23 +60,28 @@ const snapshot = dashboard?.snapshot();
 ```
 
 Rows are deterministic, parent-before-child, and grouped by the root chair's
-project/folder. Children inherit the root even when their cwd is a worktree.
-The reserved `projects` chair subtree and non-project Home rows are excluded.
+project/folder. Each refresh reads the full live forest once with
+`qq-core.listAgents()`, awaits active project chairs once with `qq-core.list()`,
+and joins top-level roots by exact session ID. Children inherit the joined root.
+Grouping never consults agent cwd, worktree paths, labels, or case prose. The
+reserved `projects` chair subtree and projectless Home/system roots are omitted.
 Display fallbacks never surface a physical UUID: alias, then a non-UUID human
 label, then `session`. UUIDs remain available only as action/topology identity.
 `idleForMs` is a nonnegative duration or `null`; missing, negative, or non-finite
 source values remain unknown (`null`) so consumers render no timer.
 
-The plugin performs a full private-cache refresh on agent lifecycle/status
-events. A short timer updates live `qq-core` agent rows for idle-duration
-freshness, but reuses the last workflow aggregate between its independent
-30-second refreshes; project catalog refresh is likewise cadence-limited to 30
-seconds. Lifecycle events force an immediate aggregate refresh. In particular,
-the UI's ~100 ms read cadence is never used to poll workflow ledgers. Therefore
-UI sheets may call `snapshot()` every ~100 ms without causing filesystem,
-network, credential, or subprocess work. Optional workflow replacement or failure cannot suppress live
-session state. Architect phase is consumed only from the fixed synchronous
-aggregate method:
+Construction publishes a valid empty snapshot immediately and starts the first
+private-cache refresh in the background. A short owner timer and agent
+lifecycle/status events refresh both `qq-core` projections. Refreshes are
+serialized and burst-coalesced, so slow asynchronous `list()` reads never
+overlap or build an unbounded backlog. Timer refreshes reuse the last workflow
+aggregate between its independent 30-second cadence; lifecycle events force an
+aggregate refresh. In particular, the UI's ~100 ms read cadence is never used
+to poll qq-core or workflow ledgers. Therefore UI sheets may call `snapshot()`
+every ~100 ms without causing filesystem, network, credential, or subprocess
+work. A failed core refresh retains the last complete core pair, and optional
+workflow replacement or failure cannot suppress live session state. Architect
+phase is consumed only from the fixed synchronous aggregate method:
 
 ```js
 ctx.get("qq-workflows", false)?.workflows?.snapshots()
