@@ -64,13 +64,19 @@ project/folder. Children inherit the root even when their cwd is a worktree.
 The reserved `projects` chair subtree and non-project Home rows are excluded.
 Display fallbacks never surface a physical UUID: alias, then a non-UUID human
 label, then `session`. UUIDs remain available only as action/topology identity.
+`idleForMs` is a nonnegative duration or `null`; missing, negative, or non-finite
+source values remain unknown (`null`) so consumers render no timer.
 
-The plugin refreshes its private cache on agent lifecycle/status events and a
-short timer. Project catalog refresh is separately cadence-limited. Therefore
+The plugin performs a full private-cache refresh on agent lifecycle/status
+events. A short timer updates live `qq-core` agent rows for idle-duration
+freshness, but reuses the last workflow aggregate between its independent
+30-second refreshes; project catalog refresh is likewise cadence-limited to 30
+seconds. Lifecycle events force an immediate aggregate refresh. In particular,
+the UI's ~100 ms read cadence is never used to poll workflow ledgers. Therefore
 UI sheets may call `snapshot()` every ~100 ms without causing filesystem,
-network, credential, or subprocess work. Optional workflow replacement or
-failure cannot suppress live session state. Architect phase is consumed only
-from the fixed synchronous aggregate method:
+network, credential, or subprocess work. Optional workflow replacement or failure cannot suppress live
+session state. Architect phase is consumed only from the fixed synchronous
+aggregate method:
 
 ```js
 ctx.get("qq-workflows", false)?.workflows?.snapshots()

@@ -16,6 +16,7 @@ export function apply(ctx, config = {}) {
     workflows: () => ctx.get?.("qq-workflows", false) ?? null,
     now: typeof config.now === "function" ? config.now : Date.now,
     catalogRefreshMs: config.catalogRefreshMs,
+    workflowRefreshMs: config.workflowRefreshMs,
     // Optional static non-secret display rows only. No provider refresh or
     // credentials cross this plugin boundary.
     usage: config.usage,
@@ -29,7 +30,11 @@ export function apply(ctx, config = {}) {
       if (typeof off === "function") disposers.push(off);
     }
   }
-  const timer = setInterval(() => { cache.refresh(); }, refreshCadence(config.refreshMs));
+  // Timer ticks update in-memory live rows and the cadence-limited project
+  // catalog, but reuse cached workflow rows. The workflow aggregate can read
+  // ledgers synchronously and is refreshed only on its safe cadence or on
+  // lifecycle events, never at the UI polling cadence.
+  const timer = setInterval(() => { cache.tick(); }, refreshCadence(config.refreshMs));
   timer.unref?.();
 
   const dispose = () => {

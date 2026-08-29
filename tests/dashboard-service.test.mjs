@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { apply, inject, name, provide } from "../src/plugin.mjs";
-import { createDashboardCache } from "../src/service.mjs";
+import { createDashboardCache, defaults as cacheDefaults } from "../src/service.mjs";
 import { DASHBOARD_SCHEMA, normalizeUsage, projectSnapshot } from "../src/snapshot.mjs";
 
 const IDS = Object.freeze({
@@ -158,7 +158,7 @@ test("groups live topology by root project with safe aliases, status and determi
   assert.deepEqual(alpha.map((row) => row.depth), [0, 0, 1, 2]);
   assert.deepEqual(alpha.map((row) => row.parentSessionId), ["", "", IDS.alpha10, IDS.child2]);
   assert.deepEqual(alpha.map((row) => row.activity), ["idle", "working", "idle", "idle"]);
-  assert.deepEqual(alpha.map((row) => row.idleForMs), [456, null, 12_345, 0]);
+  assert.deepEqual(alpha.map((row) => row.idleForMs), [456, null, 12_345, null]);
   assert.deepEqual(alpha[1], {
     sessionId: IDS.alpha10,
     alias: "10",
@@ -180,6 +180,24 @@ test("groups live topology by root project with safe aliases, status and determi
   assert.equal(beta.workflow, "architect");
   assert.equal(beta.phase, "work");
   assert.equal(beta.phaseStartedAt, 1_787_999_500_000);
+});
+
+test("unknown idle durations stay null instead of creating a fake zero timer", () => {
+  const values = [undefined, -1, Number.NaN, Number.POSITIVE_INFINITY, 0, 1.9];
+  const projected = values.map((idle_for_ms) => projectSnapshot({
+    projects: catalog(),
+    agents: [{
+      id: IDS.alpha10,
+      alias: "1",
+      label: "chair",
+      status: "idle",
+      ...(idle_for_ms === undefined ? {} : { idle_for_ms }),
+      parent: "",
+      cwd: "/projects/alpha",
+    }],
+  }).projects[0].sessions[0].idleForMs);
+
+  assert.deepEqual(projected, [null, null, null, null, 0, 1]);
 });
 
 test("only the workflow aggregate supplies semantic phase and malformed rows stay unknown", () => {
@@ -326,6 +344,7 @@ test("cache snapshot performs no dependency reads and tolerates optional workflo
     workflows: () => workflows,
     now: () => now,
     catalogRefreshMs: 10_000,
+    workflowRefreshMs: 1_000,
   });
   assert.equal(projectCalls, 1);
   assert.equal(agentCalls, 1);
@@ -342,11 +361,30 @@ test("cache snapshot performs no dependency reads and tolerates optional workflo
   assert.equal(beta.phase, "plan");
   assert.equal(beta.phaseStartedAt, 900);
 
+  now += 100;
+  cache.tick();
+  assert.equal(projectCalls, 1, "project filesystem classification stays cadence-cached");
+  assert.equal(agentCalls, 2, "a timer tick may refresh in-memory live rows");
+  assert.equal(workflowCalls, 1, "a timer tick must not read workflow ledgers");
+  assert.equal(
+    cache.service.snapshot().projects.find((project) => project.name === "beta").sessions[0].phase,
+    "plan",
+    "a sub-cadence timer tick reuses the last workflow aggregate",
+  );
+
+  now += 899;
+  cache.tick();
+  assert.equal(workflowCalls, 1, "workflow rows remain cached just before their cadence");
+  now += 1;
+  cache.tick();
+  assert.equal(workflowCalls, 2, "workflow rows eventually refresh at a safe owner cadence");
+
   workflowMode = "throw";
   now += 100;
   cache.refresh();
   assert.equal(projectCalls, 1, "project filesystem classification stays cadence-cached");
-  assert.equal(agentCalls, 2);
+  assert.equal(agentCalls, 5);
+  assert.equal(workflowCalls, 3, "an explicit lifecycle refresh updates workflow rows");
   const noWorkflow = cache.service.snapshot();
   assert.equal(noWorkflow.projects.find((project) => project.name === "beta").sessions[0].phase, "none");
   assert.equal(noWorkflow.projects[0].sessions.length, 4);
@@ -389,13 +427,15 @@ test("empty and failing project catalogs are cadence-limited outside snapshot", 
   assert.deepEqual(cache.service.snapshot().projects, []);
 });
 
-test("Cordis plugin provides cache, refreshes on lifecycle events and disposes effects", () => {
+test("Cordis plugin provides cache, uses lightweight timer ticks, and disposes effects", async () => {
   assert.equal(name, "qq-dashboard");
   assert.equal(provide, "qq-dashboard");
   assert.deepEqual(inject, ["qq-core"]);
+  assert.equal(cacheDefaults.workflowRefreshMs, 30_000);
 
   let status = "idle";
   let calls = 0;
+  let workflowCalls = 0;
   const listeners = new Map();
   const removed = [];
   const effects = [];
@@ -415,8 +455,20 @@ test("Cordis plugin provides cache, refreshes on lifecycle events and disposes e
       }];
     },
   };
+  const workflows = {
+    workflows: {
+      snapshots() {
+        workflowCalls += 1;
+        return [];
+      },
+    },
+  };
   const ctx = {
-    get(service) { return service === "qq-core" ? core : null; },
+    get(service) {
+      if (service === "qq-core") return core;
+      if (service === "qq-workflows") return workflows;
+      return null;
+    },
     provide(service, value) { provided.set(service, value); },
     on(event, listener) {
       listeners.set(event, listener);
@@ -424,18 +476,24 @@ test("Cordis plugin provides cache, refreshes on lifecycle events and disposes e
     },
     effect(factory) { effects.push(factory()); },
   };
-  const disposeReturned = apply(ctx, { refreshMs: 60_000 });
+  const disposeReturned = apply(ctx, { refreshMs: 50 });
   const service = provided.get("qq-dashboard");
   assert.equal(service.snapshot().projects[0].sessions[0].activity, "idle");
   const afterApply = calls;
   service.snapshot();
   service.snapshot();
   assert.equal(calls, afterApply, "UI-frequency reads must not touch qq-core");
+  assert.equal(workflowCalls, 1);
+
+  await new Promise((resolve) => setTimeout(resolve, 130));
+  assert.ok(calls > afterApply, "the owner timer should refresh live agent rows");
+  assert.equal(workflowCalls, 1, "owner timer ticks must not poll workflow ledgers");
 
   status = "running";
   listeners.get("agent/status")?.({});
   assert.equal(service.snapshot().projects[0].sessions[0].activity, "working");
   assert.equal(service.snapshot().projects[0].sessions[0].idleForMs, null);
+  assert.equal(workflowCalls, 2, "agent lifecycle events perform a full refresh");
   disposeReturned();
   effects[0]?.();
   assert.deepEqual(new Set(removed), new Set(["agent/created", "agent/status", "agent/disposed"]));

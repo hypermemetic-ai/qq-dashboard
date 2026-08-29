@@ -1,6 +1,7 @@
 import { normalizeUsage, projectSnapshot } from "./snapshot.mjs";
 
 const DEFAULT_CATALOG_REFRESH_MS = 30_000;
+const DEFAULT_WORKFLOW_REFRESH_MS = 30_000;
 
 function optional(getter) {
   if (typeof getter !== "function") return null;
@@ -19,14 +20,16 @@ function workflowRows(service) {
 }
 
 /**
- * Own the dependency reads outside the public snapshot() call. Call refresh()
- * from host events/a timer; snapshot() is then just one cached object read.
+ * Own the dependency reads outside the public snapshot() call. Full refreshes
+ * include the optional workflow aggregate; lightweight timer ticks reuse those
+ * rows between cadence refreshes. snapshot() is always one cached object read.
  */
 export function createDashboardCache({
   core,
   workflows,
   now = Date.now,
   catalogRefreshMs = DEFAULT_CATALOG_REFRESH_MS,
+  workflowRefreshMs = DEFAULT_WORKFLOW_REFRESH_MS,
   usage,
 } = {}) {
   if (!core || typeof core.listAgents !== "function" || typeof core.listProjects !== "function") {
@@ -37,11 +40,14 @@ export function createDashboardCache({
   const usageCache = normalizeUsage(usage, initialAt);
   let catalog = [];
   let agents = [];
+  let workflowsCache = [];
   let catalogObserved = false;
+  let workflowObserved = false;
   let lastCatalogAt = -Infinity;
+  let lastWorkflowAt = -Infinity;
   let current = projectSnapshot({ generatedAt: initialAt, usage: usageCache });
 
-  function refresh() {
+  function update({ refreshWorkflows }) {
     const observedNow = now();
     const at = Number.isFinite(observedNow) && observedNow >= 0 ? Math.floor(observedNow) : 0;
     const cadence = Number.isFinite(catalogRefreshMs) && catalogRefreshMs >= 0
@@ -63,14 +69,30 @@ export function createDashboardCache({
     } catch {
       // Keep the last complete live catalog across a transient core failure.
     }
+    const workflowCadence = Number.isFinite(workflowRefreshMs) && workflowRefreshMs >= 0
+      ? workflowRefreshMs
+      : DEFAULT_WORKFLOW_REFRESH_MS;
+    if (refreshWorkflows || !workflowObserved || at - lastWorkflowAt >= workflowCadence) {
+      workflowObserved = true;
+      lastWorkflowAt = at;
+      workflowsCache = workflowRows(optional(workflows));
+    }
     current = projectSnapshot({
       generatedAt: at,
       projects: catalog,
       agents,
-      workflowRows: workflowRows(optional(workflows)),
+      workflowRows: workflowsCache,
       usage: usageCache,
     });
     return current;
+  }
+
+  function refresh() {
+    return update({ refreshWorkflows: true });
+  }
+
+  function tick() {
+    return update({ refreshWorkflows: false });
   }
 
   const service = Object.freeze({
@@ -79,7 +101,10 @@ export function createDashboardCache({
   });
 
   refresh();
-  return Object.freeze({ service, refresh });
+  return Object.freeze({ service, refresh, tick });
 }
 
-export const defaults = Object.freeze({ catalogRefreshMs: DEFAULT_CATALOG_REFRESH_MS });
+export const defaults = Object.freeze({
+  catalogRefreshMs: DEFAULT_CATALOG_REFRESH_MS,
+  workflowRefreshMs: DEFAULT_WORKFLOW_REFRESH_MS,
+});

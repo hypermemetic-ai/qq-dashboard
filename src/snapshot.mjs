@@ -121,7 +121,7 @@ function normalizeAgents(agents) {
       status: candidate.status === "running" ? "running" : "idle",
       idleForMs: Number.isFinite(candidate.idle_for_ms) && candidate.idle_for_ms >= 0
         ? Math.floor(candidate.idle_for_ms)
-        : 0,
+        : null,
       parent: SESSION_ID.test(parent) && parent !== id ? parent : "",
       cwd: normalizePath(candidate.cwd),
       project: text(candidate.project),
