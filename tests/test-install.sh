@@ -36,7 +36,19 @@ default_root="$test_home/.local/lib/qq/dashboard"
 [[ -x "$default_root/bin/qq-dashboard" ]]
 [[ -x "$default_root/bin/qq-dashboard-cookies" ]]
 [[ -f "$default_root/bin/lib/telemetry-lib.sh" ]]
+[[ -f "$default_root/package.json" ]]
+[[ -f "$default_root/src/plugin.mjs" ]]
+[[ -f "$default_root/src/service.mjs" ]]
+[[ -f "$default_root/src/snapshot.mjs" ]]
 [[ $(<"$default_root/share/qq-dashboard/source-commit") == "$product_commit" ]]
+node --input-type=module - "$default_root" <<'NODE'
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const root = process.argv[2];
+const plugin = await import(pathToFileURL(`${root}/src/plugin.mjs`));
+assert.equal(plugin.name, "qq-dashboard");
+assert.equal(plugin.provide, "qq-dashboard");
+NODE
 HOME="$test_home" "$default_root/bin/qq-dashboard" --help >"$TMP/dashboard-help"
 HOME="$test_home" "$default_root/bin/qq-dashboard-cookies" --help >"$TMP/cookies-help"
 grep -Fq 'Usage: qq-dashboard [--once] [--help]' "$TMP/dashboard-help"
@@ -112,6 +124,8 @@ QQ_DASHBOARD_INSTALL_ROOT="$override_root" "$product_source/install.sh" \
 [[ -x "$override_root/bin/qq-dashboard" ]]
 [[ -x "$override_root/bin/qq-dashboard-cookies" ]]
 [[ -f "$override_root/bin/lib/telemetry-lib.sh" ]]
+[[ -f "$override_root/package.json" ]]
+[[ -f "$override_root/src/plugin.mjs" ]]
 [[ $(<"$override_root/share/qq-dashboard/source-commit") == "$upgrade_commit" ]]
 [[ ! -e "$TMP/.local/state/qq/telemetry" ]]
 

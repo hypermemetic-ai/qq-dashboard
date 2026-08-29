@@ -1,6 +1,6 @@
 {
   "name": "@hypermemetic-ai/qq-dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -8,6 +8,19 @@
     "qq-dashboard-cookies": "bin/qq-dashboard-cookies"
   },
   "scripts": {
-    "test": "tests/test-dashboard.sh && tests/test-install.sh"
-  }
+    "check": "node --check src/plugin.mjs && node --check src/service.mjs && node --check src/snapshot.mjs",
+    "test": "npm run check && node --test tests/*.test.mjs && tests/test-dashboard.sh && tests/test-install.sh"
+  },
+  "description": "Cached, presentation-neutral QQ live operator snapshot and terminal provider dashboard.",
+  "main": "src/plugin.mjs",
+  "exports": {
+    ".": "./src/plugin.mjs",
+    "./service": "./src/service.mjs",
+    "./snapshot": "./src/snapshot.mjs"
+  },
+  "files": [
+    "src/",
+    "bin/",
+    "README.md"
+  ]
 }
