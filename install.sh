@@ -64,12 +64,21 @@ trap cleanup EXIT
 install -D -m 0755 "$source_root/bin/qq-dashboard" "$stage/bin/qq-dashboard"
 install -D -m 0755 "$source_root/bin/qq-dashboard-cookies" "$stage/bin/qq-dashboard-cookies"
 install -D -m 0644 "$source_root/bin/lib/telemetry-lib.sh" "$stage/bin/lib/telemetry-lib.sh"
+install -D -m 0644 "$source_root/package.json" "$stage/package.json"
+install -D -m 0644 "$source_root/README.md" "$stage/README.md"
+install -D -m 0644 "$source_root/src/plugin.mjs" "$stage/src/plugin.mjs"
+install -D -m 0644 "$source_root/src/service.mjs" "$stage/src/service.mjs"
+install -D -m 0644 "$source_root/src/snapshot.mjs" "$stage/src/snapshot.mjs"
 install -D -m 0644 /dev/null "$stage/share/qq-dashboard/source-commit"
 printf '%s\n' "$source_commit" >"$stage/share/qq-dashboard/source-commit"
 
 [[ -x "$stage/bin/qq-dashboard" \
   && -x "$stage/bin/qq-dashboard-cookies" \
   && -f "$stage/bin/lib/telemetry-lib.sh" \
+  && -f "$stage/package.json" \
+  && -f "$stage/src/plugin.mjs" \
+  && -f "$stage/src/service.mjs" \
+  && -f "$stage/src/snapshot.mjs" \
   && $(<"$stage/share/qq-dashboard/source-commit") == "$source_commit" ]] \
   || fail "staged artifact is incomplete"
 
