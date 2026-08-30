@@ -75,9 +75,10 @@ private-cache refresh in the background. A short owner timer and agent
 lifecycle/status events refresh both `qq-core` projections. Refreshes are
 serialized and burst-coalesced, so slow asynchronous `list()` reads never
 overlap or build an unbounded backlog. Timer refreshes reuse the last workflow
-aggregate between its independent 30-second cadence; lifecycle events force an
-aggregate refresh. In particular, the UI's ~100 ms read cadence is never used
-to poll qq-core or workflow ledgers. Therefore UI sheets may call `snapshot()`
+aggregate and provider-usage file between their independent 30-second cadences;
+lifecycle events force a workflow aggregate refresh but never bypass the usage
+cadence. In particular, the UI's ~100 ms read cadence is never used to poll
+qq-core, workflow ledgers, or the filesystem. Therefore UI sheets may call `snapshot()`
 every ~100 ms without causing filesystem, network, credential, or subprocess
 work. A failed core refresh retains the last complete core pair, and optional
 workflow replacement or failure cannot suppress live session state. Architect
@@ -88,10 +89,65 @@ ctx.get("qq-workflows", false)?.workflows?.snapshots()
 // [{ sessionUuid, workflow, phase, phaseStartedAt }]
 ```
 
-Structured provider usage is a strict non-secret display cache. The MVP cache
-is intentionally empty; the terminal dashboard remains the provider-plan
-surface. No credentials, cookies, local session paths, or provider refresh
-callbacks cross the service boundary.
+Structured provider usage is a strict non-secret display cache shared by the
+terminal producer and optional in-process reader. After every fetched `--once`
+or interactive frame, `qq-dashboard` atomically replaces this file with mode
+`0600`:
+
+```text
+~/.local/state/qq/telemetry/usage-cache.json
+```
+
+The on-disk envelope is separate from the public dashboard schema:
+
+```js
+{
+  schema: "qq.dashboard-usage/v1",
+  generatedAt: 1788000000000,       // producer-cycle epoch milliseconds
+  providers: [{
+    id: "codex",
+    label: "Codex",
+    state: "ready",
+    observedAt: 1788000000000,
+    meters: [{
+      id: "weekly",
+      label: "7d",
+      usedRatio: 0.42,
+      resetAt: 1788600000000,
+      detail: ""
+    }]
+  }]
+}
+```
+
+A valid producer cycle contains Codex, Grok, and Qwen rows even when a provider
+is unavailable. States have exact display-cache meanings:
+
+- `ready`: a fresh provider reading;
+- `estimated`: a calibrated Qwen estimate derived from the local token meter;
+- `stale`: the last Qwen provider reading, still inside its quota window; and
+- `unavailable`: no usable reading for this cycle (`observedAt: null`, no
+  meters).
+
+All timestamps are epoch milliseconds or `null`. Stable meter identities are
+`weekly` / `7d` and, for Qwen when known, `five-hour` / `5h`. `usedRatio` is a
+nonnegative number and may exceed one. `detail` contains only neutral display
+text such as a Qwen used/limit value and an `estimated` marker.
+
+The plugin reads the file once during its initial owner refresh and then at most
+once per its independent 30-second usage cadence. It rejects symlinks,
+non-regular or oversized files, malformed JSON, wrong schemas, and invalid
+rows. Missing or rejected input starts empty and later preserves the last valid
+cache; it never suppresses live project/session state. A static `config.usage`
+remains available for embedders and tests and suppresses the default file
+reader unless an explicit `config.usageFor` is injected.
+
+The host-side reader never reads authentication or cookie stores, performs
+provider requests, or spawns the terminal command. The producer serializes only
+the normalized fields above and writes through a same-directory temporary file,
+so credentials, cookies, raw provider payloads, execution profiles, ANSI text,
+and local session paths never cross the service boundary. Running
+`qq-dashboard` is what creates and refreshes the web-visible cache.
 
 ### Host composition
 
@@ -119,7 +175,8 @@ text or title. Host loading and qq-ui rendering are owned by those respective
 compositions; this package does not mount HTTP routes.
 
 Pure consumers/tests may import `@hypermemetic-ai/qq-dashboard/snapshot`; cache
-owners may import `@hypermemetic-ai/qq-dashboard/service`.
+owners may import `@hypermemetic-ai/qq-dashboard/service`. The strict file
+reader and path helper are exported from `@hypermemetic-ai/qq-dashboard/usage-cache`.
 
 ## Terminal commands
 

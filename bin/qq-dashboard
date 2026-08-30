@@ -13,6 +13,7 @@ AUTH_FILE="${TELEMETRY_HOME}/.pi/agent/auth.json"
 PROFILE_COMMAND="${QQ_PROFILE_BIN:-qq-profile}"
 METER_CACHE="${TELEMETRY_HOME}/.local/state/qq/telemetry/meter-cache.json"
 FRAME_FILE="${TELEMETRY_HOME}/.local/state/qq/telemetry/last-frame.txt"
+USAGE_CACHE="${TELEMETRY_HOME}/.local/state/qq/telemetry/usage-cache.json"
 REFRESH_SECS="${TELEMETRY_REFRESH:-30}"
 QWEN_GW_CADENCE="${TELEMETRY_QWEN_GW_CADENCE:-300}"
 QWEN_MTR_CADENCE="${TELEMETRY_REFRESH:-30}"
@@ -24,7 +25,9 @@ C_BOLD=$'\033[1m'
 C_RED=$'\033[31m'
 
 TELEMETRY_TMP=""
+USAGE_CACHE_TMP=""
 cleanup() {
+  if [ -n "$USAGE_CACHE_TMP" ]; then rm -f -- "$USAGE_CACHE_TMP"; fi
   if [ -n "$TELEMETRY_TMP" ] && [ -d "$TELEMETRY_TMP" ]; then
     rm -rf -- "$TELEMETRY_TMP"
   fi
@@ -115,6 +118,25 @@ GPT_WEEK='7d       unavailable'
 GROK_WEEK='7d       unavailable'
 QWEN_L1='7d       unavailable'
 QWEN_L2=''
+
+# Presentation-neutral, non-secret usage fields persisted after each fetch.
+USAGE_GENERATED_AT=0
+CODEX_USAGE_STATE=unavailable
+CODEX_USAGE_OBSERVED_AT=''
+CODEX_USAGE_RATIO=''
+CODEX_USAGE_RESET_AT=''
+GROK_USAGE_STATE=unavailable
+GROK_USAGE_OBSERVED_AT=''
+GROK_USAGE_RATIO=''
+GROK_USAGE_RESET_AT=''
+QWEN_USAGE_STATE=unavailable
+QWEN_USAGE_OBSERVED_AT=''
+QWEN_WEEKLY_RATIO=''
+QWEN_WEEKLY_RESET_AT=''
+QWEN_WEEKLY_DETAIL=''
+QWEN_FIVE_RATIO=''
+QWEN_FIVE_RESET_AT=''
+QWEN_FIVE_DETAIL=''
 
 ROLES_BODY=''
 
@@ -539,9 +561,17 @@ qwen_render_rows() {
   # note (e.g. the age) appended inside the dim span; the EXHAUSTED wall flag
   # stays colored in both styles.
   local p1w="$1" p1wr="$2" p5="$3" p5r="$4" ceilw="$5" ceil5="$6" dim="${7:-0}" note="${8:-}" observed_ts="${9:-0}"
-  local tokenw used5 col flag weekly_inactive=0 weekly_reset five_reset
+  local usage_state="${10:-ready}" tokenw used5 col flag weekly_inactive=0 weekly_reset five_reset
   QWEN_L1='7d       unavailable'
   QWEN_L2=''
+  QWEN_USAGE_STATE=unavailable
+  QWEN_USAGE_OBSERVED_AT=''
+  QWEN_WEEKLY_RATIO=''
+  QWEN_WEEKLY_RESET_AT=''
+  QWEN_WEEKLY_DETAIL=''
+  QWEN_FIVE_RATIO=''
+  QWEN_FIVE_RESET_AT=''
+  QWEN_FIVE_DETAIL=''
   if [[ "$p1w" =~ ^[0-9]+([.][0-9]+)?$ && "$ceilw" =~ ^[0-9]+$ ]]; then
     if [[ "$p1wr" =~ ^[0-9]+$ ]]; then
       weekly_reset="reset $(epoch_local "$((p1wr / 1000))")"
@@ -555,6 +585,11 @@ qwen_render_rows() {
     fi
     if [ -n "$weekly_reset" ]; then
       tokenw=$(awk -v p="$p1w" -v c="$ceilw" 'BEGIN { printf "%d", p*c }')
+      QWEN_USAGE_STATE=$usage_state
+      [[ "$observed_ts" =~ ^[0-9]+$ ]] && [ "$observed_ts" -gt 0 ] && QWEN_USAGE_OBSERVED_AT=$((observed_ts * 1000))
+      QWEN_WEEKLY_RATIO=$p1w
+      [[ "$p1wr" =~ ^[0-9]+$ ]] && QWEN_WEEKLY_RESET_AT=$p1wr
+      QWEN_WEEKLY_DETAIL="$tokenw / $ceilw"
       flag="$(exhausted_flag "$p1w" "$QWEN_WALL_TEXT" "$QWEN_WALL_TS" "$observed_ts")"
       if [ "$dim" = 1 ]; then
         QWEN_L1="${C_DIM}7d       $(bar "$p1w") $(fmt_num "$tokenw") / $(fmt_num "$ceilw")   ${weekly_reset}  ${note}${C_RESET}"
@@ -578,6 +613,9 @@ qwen_render_rows() {
     fi
     if [ -n "$five_reset" ]; then
       used5=$(awk -v p="$p5" -v c="$ceil5" 'BEGIN { printf "%d", p*c }')
+      QWEN_FIVE_RATIO=$p5
+      [[ "$p5r" =~ ^[0-9]+$ ]] && QWEN_FIVE_RESET_AT=$p5r
+      QWEN_FIVE_DETAIL="$used5 / $ceil5"
       if [ "$dim" = 1 ]; then
         QWEN_L2="${C_DIM}5h       $(bar "$p5") $(fmt_num "$used5") / $(fmt_num "$ceil5")   ${five_reset}${C_RESET}"
       else
@@ -593,6 +631,14 @@ qwen_update() {
   local usage qconf p5 p1w p5r p1wr ceil5n ceilwn tokenw frac col flag projected
   QWEN_L1='7d       unavailable'
   QWEN_L2=''
+  QWEN_USAGE_STATE=unavailable
+  QWEN_USAGE_OBSERVED_AT=''
+  QWEN_WEEKLY_RATIO=''
+  QWEN_WEEKLY_RESET_AT=''
+  QWEN_WEEKLY_DETAIL=''
+  QWEN_FIVE_RATIO=''
+  QWEN_FIVE_RESET_AT=''
+  QWEN_FIVE_DETAIL=''
 
   qwen_gateway_state_load
 
@@ -634,7 +680,7 @@ qwen_update() {
     p1wr=$(jq -r '.data.DataV2.data.data.per1WeekResetTime // empty' <<<"$usage" 2>/dev/null || true)
     ceil5n=$(tier_ceiling "$qconf" "$spec" five_hour || true)
     ceilwn=$(tier_ceiling "$qconf" "$spec" weekly || true)
-    qwen_render_rows "$p1w" "$p1wr" "$p5" "$p5r" "$ceilwn" "$ceil5n" 0 '' "$QWEN_GW_TS"
+    qwen_render_rows "$p1w" "$p1wr" "$p5" "$p5r" "$ceilwn" "$ceil5n" 0 '' "$QWEN_GW_TS" ready
     if [ "$QWEN_L1" != '7d       unavailable' ]; then
       if [ "$fetched" = 1 ]; then
         tokenw=$(awk -v p="$p1w" -v c="$ceilwn" 'BEGIN { printf "%d", p*c }')
@@ -702,7 +748,15 @@ qwen_update() {
       frac5=$(awk -v p="$est5" -v c="$QWEN_PERSISTED_CEIL5" 'BEGIN { print (c>0) ? p/c : 0 }')
       col=$(color_frac "$frac5")
       QWEN_L2="5h       ${col}$(bar "$frac5")${C_RESET} ${col}$(fmt_num "$est5") / $(fmt_num "$QWEN_PERSISTED_CEIL5")${C_RESET}"
+      QWEN_FIVE_RATIO=$frac5
+      [[ "$QWEN_PERSISTED_P5R" =~ ^[0-9]+$ ]] && QWEN_FIVE_RESET_AT=$QWEN_PERSISTED_P5R
+      QWEN_FIVE_DETAIL="$est5 / $QWEN_PERSISTED_CEIL5 estimated"
     fi
+    QWEN_USAGE_STATE=estimated
+    QWEN_USAGE_OBSERVED_AT=$((QWEN_PERSISTED_TS * 1000))
+    QWEN_WEEKLY_RATIO=$frac
+    QWEN_WEEKLY_RESET_AT=$QWEN_PERSISTED_P1WR
+    QWEN_WEEKLY_DETAIL="$projected / $QWEN_PERSISTED_CEILW estimated"
     return
   fi
 
@@ -712,7 +766,7 @@ qwen_update() {
      [ "$QWEN_PERSISTED_TS" -gt 0 ] && [ "$now" -le "$((QWEN_PERSISTED_P1WR / 1000))" ]; then
     age=$((now - QWEN_PERSISTED_TS))
     [ "$age" -lt 0 ] && age=0
-    qwen_render_rows "$QWEN_PERSISTED_P1W" "$QWEN_PERSISTED_P1WR" "$QWEN_PERSISTED_P5" "$QWEN_PERSISTED_P5R" "$QWEN_PERSISTED_CEILW" "$QWEN_PERSISTED_CEIL5" 1 "$(fmt_age "$age")" "$QWEN_PERSISTED_TS"
+    qwen_render_rows "$QWEN_PERSISTED_P1W" "$QWEN_PERSISTED_P1WR" "$QWEN_PERSISTED_P5" "$QWEN_PERSISTED_P5R" "$QWEN_PERSISTED_CEILW" "$QWEN_PERSISTED_CEIL5" 1 "$(fmt_age "$age")" "$QWEN_PERSISTED_TS" stale
     return
   fi
 
@@ -726,16 +780,25 @@ qwen_update() {
 fetch_all() {
   local auth='' codex_access codex_account
   local body frac col
-  local pct reset_at now
+  local pct reset_at reset_ms now
   local codex_file codex_body=''
   local -a pids=()
   local grok_access grok_file grok_body=''
   load_roles
   GPT_WEEK='7d       unavailable'
   GROK_WEEK='7d       unavailable'
+  CODEX_USAGE_STATE=unavailable
+  CODEX_USAGE_OBSERVED_AT=''
+  CODEX_USAGE_RATIO=''
+  CODEX_USAGE_RESET_AT=''
+  GROK_USAGE_STATE=unavailable
+  GROK_USAGE_OBSERVED_AT=''
+  GROK_USAGE_RATIO=''
+  GROK_USAGE_RESET_AT=''
   refresh_xai_auth
   [ -r "$AUTH_FILE" ] && auth=$(cat "$AUTH_FILE" 2>/dev/null || true)
   now=$(now_epoch)
+  USAGE_GENERATED_AT=$((now * 1000))
 
   codex_access=$(jq -r '."openai-codex".oauth.access // ."openai-codex".access // empty' <<<"$auth" 2>/dev/null || true)
   codex_account=$(jq -r '."openai-codex".oauth.accountId // ."openai-codex".accountId // empty' <<<"$auth" 2>/dev/null || true)
@@ -778,6 +841,10 @@ fetch_all() {
       frac=$(awk -v p="$pct" 'BEGIN { print p/100 }')
       col=$(color_frac "$frac")
       GPT_WEEK="7d       ${col}$(bar "$frac")${C_RESET} ${col}${pct}%${C_RESET}   ${C_DIM}reset $(epoch_local "$reset_at")${C_RESET}"
+      CODEX_USAGE_STATE=ready
+      CODEX_USAGE_OBSERVED_AT=$USAGE_GENERATED_AT
+      CODEX_USAGE_RATIO=$frac
+      CODEX_USAGE_RESET_AT=$((reset_at * 1000))
     fi
   fi
 
@@ -789,8 +856,13 @@ fetch_all() {
       frac=$(awk -v p="$pct" 'BEGIN { print p/100 }')
       col=$(color_frac "$frac")
       GROK_WEEK="7d       ${col}$(bar "$frac")${C_RESET} ${col}${pct}%${C_RESET}"
+      GROK_USAGE_STATE=ready
+      GROK_USAGE_OBSERVED_AT=$USAGE_GENERATED_AT
+      GROK_USAGE_RATIO=$frac
       if [ -n "$reset_at" ] && [ "$reset_at" != null ]; then
         GROK_WEEK+="   ${C_DIM}reset $(iso_local "$reset_at")${C_RESET}"
+        reset_ms=$(date -d "$reset_at" '+%s000' 2>/dev/null || true)
+        [[ "$reset_ms" =~ ^[0-9]+$ ]] && GROK_USAGE_RESET_AT=$reset_ms
       fi
     fi
   fi
@@ -799,8 +871,60 @@ fetch_all() {
   return 0
 }
 
+persist_usage_cache() {
+  # This file is the only bridge to the in-process dashboard service. It holds
+  # display data only: never credentials, raw provider payloads, or local paths.
+  local state_dir tmp
+  state_dir=$(dirname -- "$USAGE_CACHE")
+  mkdir -p -- "$state_dir" 2>/dev/null || return 1
+  tmp=$(mktemp "$state_dir/.usage-cache.XXXXXX" 2>/dev/null) || return 1
+  USAGE_CACHE_TMP=$tmp
+  if ! jq -cn \
+      --argjson generated "$USAGE_GENERATED_AT" \
+      --arg codex_state "$CODEX_USAGE_STATE" --arg codex_observed "$CODEX_USAGE_OBSERVED_AT" \
+      --arg codex_ratio "$CODEX_USAGE_RATIO" --arg codex_reset "$CODEX_USAGE_RESET_AT" \
+      --arg grok_state "$GROK_USAGE_STATE" --arg grok_observed "$GROK_USAGE_OBSERVED_AT" \
+      --arg grok_ratio "$GROK_USAGE_RATIO" --arg grok_reset "$GROK_USAGE_RESET_AT" \
+      --arg qwen_state "$QWEN_USAGE_STATE" --arg qwen_observed "$QWEN_USAGE_OBSERVED_AT" \
+      --arg qwen_weekly "$QWEN_WEEKLY_RATIO" --arg qwen_weekly_reset "$QWEN_WEEKLY_RESET_AT" \
+      --arg qwen_weekly_detail "$QWEN_WEEKLY_DETAIL" --arg qwen_five "$QWEN_FIVE_RATIO" \
+      --arg qwen_five_reset "$QWEN_FIVE_RESET_AT" --arg qwen_five_detail "$QWEN_FIVE_DETAIL" '
+    def number_or_null($value): try ($value | tonumber) catch null;
+    def meter($id; $label; $ratio; $reset; $detail):
+      (number_or_null($ratio)) as $used
+      | if $used == null then [] else [{
+          id: $id, label: $label, usedRatio: $used,
+          resetAt: number_or_null($reset), detail: $detail
+        }] end;
+    {
+      schema: "qq.dashboard-usage/v1",
+      generatedAt: $generated,
+      providers: [
+        {id: "codex", label: "Codex", state: $codex_state,
+         observedAt: number_or_null($codex_observed),
+         meters: meter("weekly"; "7d"; $codex_ratio; $codex_reset; "")},
+        {id: "grok", label: "Grok", state: $grok_state,
+         observedAt: number_or_null($grok_observed),
+         meters: meter("weekly"; "7d"; $grok_ratio; $grok_reset; "")},
+        {id: "qwen", label: "Qwen", state: $qwen_state,
+         observedAt: number_or_null($qwen_observed),
+         meters: (meter("weekly"; "7d"; $qwen_weekly; $qwen_weekly_reset; $qwen_weekly_detail)
+           + meter("five-hour"; "5h"; $qwen_five; $qwen_five_reset; $qwen_five_detail))}
+      ]
+    }
+  ' >"$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    USAGE_CACHE_TMP=''
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || { rm -f -- "$tmp"; USAGE_CACHE_TMP=''; return 1; }
+  mv -f -- "$tmp" "$USAGE_CACHE" 2>/dev/null || { rm -f -- "$tmp"; USAGE_CACHE_TMP=''; return 1; }
+  USAGE_CACHE_TMP=''
+}
+
 render() {
   local frame
+  persist_usage_cache || true
   frame=$(render_body)
   if [ -t 1 ]; then printf '\033[2J\033[H'; fi
   printf '%s\n' "$frame"
