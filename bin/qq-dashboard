@@ -10,6 +10,10 @@ source "$SCRIPT_DIR/lib/telemetry-lib.sh"
 
 TELEMETRY_HOME="${HOME:-}"
 AUTH_FILE="${TELEMETRY_HOME}/.pi/agent/auth.json"
+GROK_USER_AGENT='@hypermemetic-ai/qq-models/0.0.0 (+https://github.com/hypermemetic-ai/qq)'
+GROK_CLIENT_IDENTIFIER='@hypermemetic-ai/qq-models'
+GROK_CLIENT_VERSION='1.0.3'
+GROK_CLIENT_MODE='headless'
 PROFILE_COMMAND="${QQ_PROFILE_BIN:-qq-profile}"
 METER_CACHE="${TELEMETRY_HOME}/.local/state/qq/telemetry/meter-cache.json"
 FRAME_FILE="${TELEMETRY_HOME}/.local/state/qq/telemetry/last-frame.txt"
@@ -52,10 +56,8 @@ api_get() {
 }
 
 refresh_xai_auth() {
-  # Pi refreshes the legacy built-in xai OAuth credential on use, but this
-  # panel reads auth.json directly. The xai-auth extension owns refresh for its
-  # subscription credential when Grok runs; the panel consumes that stored
-  # bearer below without taking over credential mutation.
+  # This is retained only for the legacy Pi xai fallback. The dedicated
+  # qq-models store is read-only here; qq-models alone owns its refresh cycle.
   local nowms
   [ -r "$AUTH_FILE" ] || return 0
   nowms=$(( $(now_epoch) * 1000 ))
@@ -66,6 +68,48 @@ refresh_xai_auth() {
   ' "$AUTH_FILE" >/dev/null 2>&1 || return 0
   command -v pi >/dev/null 2>&1 || return 0
   pi auth check --provider xai >/dev/null 2>&1 || true
+}
+
+grok_access_from_store() {
+  # Status 0 is a valid dedicated credential, 1 means the fixed store is
+  # absent (so the legacy Pi fallback may be used), and 2 is a fail-closed
+  # rejection. Never print diagnostics: this function's stdout is the bearer.
+  local home path component home_real file_real file_mode access
+  home=${TELEMETRY_HOME%/}
+  [ -n "$home" ] || home=/
+  [[ "$home" == /* ]] || return 2
+  [[ "$home" != *$'\n'* && "$home" != *$'\r'* ]] || return 2
+  [ -d "$home" ] && [ ! -L "$home" ] || return 2
+  home_real=$(realpath -e -- "$home" 2>/dev/null) || return 2
+  [ "$home_real" = "$home" ] || return 2
+
+  path=${home%/}
+  for component in .local state qq; do
+    path="$path/$component"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      return 1
+    fi
+    [ -d "$path" ] && [ ! -L "$path" ] || return 2
+  done
+  path="$path/.qq-grok-auth.json"
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 1
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] || return 2
+  file_mode=$(stat -c '%A' -- "$path" 2>/dev/null) || return 2
+  [ "${file_mode:1:1}" = r ] || return 2
+  file_real=$(realpath -e -- "$path" 2>/dev/null) || return 2
+  [ "$file_real" = "$path" ] || return 2
+  access=$(jq -er '
+    if type == "object"
+       and (.access | type == "string")
+       and (.access | test("^[^[:space:][:cntrl:]]+$"))
+    then .access
+    else error("invalid credential")
+    end
+  ' "$path" 2>/dev/null) || return 2
+  [ -n "$access" ] || return 2
+  printf '%s' "$access"
 }
 
 color_frac() {
@@ -784,10 +828,10 @@ qwen_update() {
 fetch_all() {
   local auth='' codex_access codex_account
   local body frac col
-  local pct reset_at reset_ms now
+  local pct reset_at reset_ms now grok_store_status
   local codex_file codex_body=''
   local -a pids=()
-  local grok_access grok_file grok_body=''
+  local grok_access='' grok_file='' grok_headers=''
   [ "$HEADLESS" = 1 ] || load_roles
   GPT_WEEK='7d       unavailable'
   GROK_WEEK='7d       unavailable'
@@ -799,42 +843,57 @@ fetch_all() {
   GROK_USAGE_OBSERVED_AT=''
   GROK_USAGE_RATIO=''
   GROK_USAGE_RESET_AT=''
-  refresh_xai_auth
   [ -r "$AUTH_FILE" ] && auth=$(cat "$AUTH_FILE" 2>/dev/null || true)
   now=$(now_epoch)
   USAGE_GENERATED_AT=$((now * 1000))
 
   codex_access=$(jq -r '."openai-codex".oauth.access // ."openai-codex".access // empty' <<<"$auth" 2>/dev/null || true)
   codex_account=$(jq -r '."openai-codex".oauth.accountId // ."openai-codex".accountId // empty' <<<"$auth" 2>/dev/null || true)
-  grok_access=$(jq -r '."xai-auth".oauth.access // ."xai-auth".access // .xai.oauth.access // .xai.access // empty' <<<"$auth" 2>/dev/null || true)
+  if grok_access=$(grok_access_from_store); then
+    :
+  else
+    grok_store_status=$?
+    grok_access=''
+    if [ "$grok_store_status" -eq 1 ]; then
+      refresh_xai_auth
+      [ -r "$AUTH_FILE" ] && auth=$(cat "$AUTH_FILE" 2>/dev/null || true)
+      grok_access=$(jq -r '."xai-auth".oauth.access // ."xai-auth".access // .xai.oauth.access // .xai.access // empty' <<<"$auth" 2>/dev/null || true)
+    fi
+  fi
 
   if [ -n "$TELEMETRY_TMP" ]; then
     codex_file="$TELEMETRY_TMP/codex.json"
     grok_file="$TELEMETRY_TMP/grok.json"
-    : >"$codex_file"
-    : >"$grok_file"
+    (umask 077; : >"$codex_file"; : >"$grok_file") || true
+    chmod 600 "$codex_file" "$grok_file" 2>/dev/null || true
     if [ -n "$codex_access" ] && [ -n "$codex_account" ]; then
       api_get 'https://chatgpt.com/backend-api/wham/usage' \
         -H "Authorization: Bearer $codex_access" -H "ChatGPT-Account-Id: $codex_account" >"$codex_file" &
       pids+=($!)
     fi
     if [ -n "$grok_access" ]; then
-      api_get 'https://cli-chat-proxy.grok.com/v1/billing?format=credits' \
-        -H "Authorization: Bearer $grok_access" >"$grok_file" &
-      pids+=($!)
+      grok_headers="$TELEMETRY_TMP/grok.headers"
+      if (umask 077; printf 'Authorization: Bearer %s\n' "$grok_access" >"$grok_headers") &&
+         chmod 600 "$grok_headers" 2>/dev/null; then
+        api_get 'https://cli-chat-proxy.grok.com/v1/billing?format=credits' \
+          -H "@$grok_headers" \
+          -H "User-Agent: $GROK_USER_AGENT" \
+          -H "x-grok-client-identifier: $GROK_CLIENT_IDENTIFIER" \
+          -H "x-grok-client-version: $GROK_CLIENT_VERSION" \
+          -H "x-grok-client-mode: $GROK_CLIENT_MODE" >"$grok_file" &
+        pids+=($!)
+      fi
     fi
     if [ "${#pids[@]}" -gt 0 ]; then wait "${pids[@]}"; fi
+    [ -z "$grok_headers" ] || rm -f -- "$grok_headers"
     codex_body=$(cat "$codex_file" 2>/dev/null || true)
-    grok_body=$(cat "$grok_file" 2>/dev/null || true)
   else
     if [ -n "$codex_access" ] && [ -n "$codex_account" ]; then
       codex_body=$(api_get 'https://chatgpt.com/backend-api/wham/usage' \
         -H "Authorization: Bearer $codex_access" -H "ChatGPT-Account-Id: $codex_account")
     fi
-    if [ -n "$grok_access" ]; then
-      grok_body=$(api_get 'https://cli-chat-proxy.grok.com/v1/billing?format=credits' \
-        -H "Authorization: Bearer $grok_access")
-    fi
+    # Grok fails closed if private request state could not be allocated. Its
+    # bearer is never interpolated into curl's process arguments.
   fi
 
   if [ -n "$codex_body" ]; then
@@ -852,10 +911,9 @@ fetch_all() {
     fi
   fi
 
-  if [ -n "$grok_body" ]; then
-    body="$grok_body"
-    pct=$(jq -r '.config.creditUsagePercent // empty' <<<"$body" 2>/dev/null || true)
-    reset_at=$(jq -r '.config.currentPeriod.end // .config.billingPeriodEnd // empty' <<<"$body" 2>/dev/null || true)
+  if [ -s "$grok_file" ]; then
+    pct=$(jq -r '.config.creditUsagePercent // empty' "$grok_file" 2>/dev/null || true)
+    reset_at=$(jq -r '.config.currentPeriod.end // .config.billingPeriodEnd // empty' "$grok_file" 2>/dev/null || true)
     if [[ "$pct" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
       frac=$(awk -v p="$pct" 'BEGIN { print p/100 }')
       col=$(color_frac "$frac")

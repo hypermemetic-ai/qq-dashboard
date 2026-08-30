@@ -108,6 +108,61 @@ PI_LOG="$TMP/pi.log" PATH="$TMP/fake-bin:$PATH" HOME="$TMP/home" \
   bash -c 'source "$1"; refresh_xai_auth' _ "$ROOT/bin/qq-dashboard"
 [[ "$(cat "$TMP/pi.log")" == 'auth check --provider xai' ]]
 
+# The dedicated qq-models credential reader accepts only the fixed, safe store.
+# Status 1 is an absent store (eligible for the legacy fallback); every unsafe
+# or malformed store is status 2 and emits no credential diagnostic.
+store_probe_err="$TMP/store-probe.err"
+probe_grok_store() {
+  local home=$1 expected=$2 actual
+  actual=$(HOME="$home" bash -c '
+    source "$1"
+    token=""
+    if token=$(grok_access_from_store); then status=0; else status=$?; fi
+    printf "%s|%s" "$status" "$token"
+  ' _ "$ROOT/bin/qq-dashboard" 2>>"$store_probe_err")
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'unexpected Grok store probe for %s: %q != %q\n' "$home" "$actual" "$expected" >&2
+    return 1
+  fi
+}
+store_home="$TMP/store-home"
+store_path="$store_home/.local/state/qq/.qq-grok-auth.json"
+mkdir -p "$store_home/.local/state/qq"
+printf '%s\n' '{"access":"store-fixture-token","refresh":"private","expires":999}' >"$store_path"
+chmod 600 "$store_path"
+probe_grok_store "$store_home" '0|store-fixture-token'
+rm "$store_path"
+probe_grok_store "$store_home" '1|'
+printf '%s\n' '{malformed' >"$store_path"
+probe_grok_store "$store_home" '2|'
+printf '%s\n' '{"access":42}' >"$store_path"
+probe_grok_store "$store_home" '2|'
+printf '%s\n' '{"access":""}' >"$store_path"
+probe_grok_store "$store_home" '2|'
+printf '%s\n' '{"access":"header injection\nvalue"}' >"$store_path"
+probe_grok_store "$store_home" '2|'
+printf '%s\n' '{"access":"unreadable"}' >"$store_path"
+chmod 000 "$store_path"
+probe_grok_store "$store_home" '2|'
+chmod 600 "$store_path"
+rm "$store_path"
+mkdir "$store_path"
+probe_grok_store "$store_home" '2|'
+rmdir "$store_path"
+printf '%s\n' '{"access":"symlink-target"}' >"$TMP/store-target.json"
+ln -s "$TMP/store-target.json" "$store_path"
+probe_grok_store "$store_home" '2|'
+unsafe_parent_home="$TMP/unsafe-parent-home"
+mkdir "$unsafe_parent_home" "$TMP/external-local"
+ln -s "$TMP/external-local" "$unsafe_parent_home/.local"
+probe_grok_store "$unsafe_parent_home" '2|'
+unsafe_home_target="$TMP/unsafe-home-target"
+mkdir "$unsafe_home_target"
+ln -s "$unsafe_home_target" "$TMP/unsafe-home-link"
+probe_grok_store "$TMP/unsafe-home-link" '2|'
+probe_grok_store relative-home '2|'
+[[ ! -s "$store_probe_err" ]]
+
 signal_tmp="$TMP/signal-cleanup"
 mkdir "$signal_tmp"
 set +e
@@ -176,6 +231,106 @@ jq -e '
 [[ "$(stat -c %a "$usage_cache")" == 600 ]]
 ! grep -Eq 'codex-access|codex-account|grok-access|runner|profile' "$usage_cache"
 ! grep -q $'\033' "$usage_cache"
+
+# Exercise the actual --once producer with a valid dedicated qq-models store.
+# The fake endpoint rejects missing identity headers, a bearer in process args,
+# an unsafe header file, or an unexpected credential. It records no secret.
+grok_home="$TMP/grok-home"
+grok_auth="$grok_home/.local/state/qq/.qq-grok-auth.json"
+mkdir -p "$grok_home/.pi/agent" "$(dirname -- "$grok_auth")"
+cat >"$grok_home/.pi/agent/auth.json" <<'JSON'
+{
+  "openai-codex": {"access":"codex-e2e-access","accountId":"codex-e2e-account"},
+  "xai-auth": {"access":"legacy-must-not-bypass"}
+}
+JSON
+cat >"$grok_auth" <<'JSON'
+{"access":"dedicated-e2e-token","refresh":"private-refresh","expires":1999999999999}
+JSON
+chmod 600 "$grok_auth"
+cp "$grok_auth" "$TMP/grok-auth-before"
+cat >"$TMP/fake-bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+url=''
+auth_file=''
+user_agent=0
+identifier=0
+version=0
+mode=0
+for argument in "$@"; do
+  [[ "$argument" != *dedicated-e2e-token* ]]
+  [[ "$argument" != *legacy-must-not-bypass* ]]
+  case "$argument" in
+    https://*) url=$argument ;;
+    @*) auth_file=${argument#@} ;;
+    'User-Agent: @hypermemetic-ai/qq-models/0.0.0 (+https://github.com/hypermemetic-ai/qq)') user_agent=1 ;;
+    'x-grok-client-identifier: @hypermemetic-ai/qq-models') identifier=1 ;;
+    'x-grok-client-version: 1.0.3') version=1 ;;
+    'x-grok-client-mode: headless') mode=1 ;;
+  esac
+done
+case "$url" in
+  *chatgpt*)
+    printf '%s\n' '{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000}}}'
+    ;;
+  *cli-chat-proxy.grok.com*)
+    [[ $user_agent = 1 && $identifier = 1 && $version = 1 && $mode = 1 ]]
+    [[ -f "$auth_file" && ! -L "$auth_file" && $(stat -c %a "$auth_file") = 600 ]]
+    grep -Fxq 'Authorization: Bearer dedicated-e2e-token' "$auth_file"
+    printf 'grok-request-ok\n' >>"$GROK_PROBE_LOG"
+    printf '%s\n' '{"config":{"creditUsagePercent":37,"currentPeriod":{"end":"2033-05-18T03:33:20Z"}},"privateRaw":"raw-billing-marker"}'
+    ;;
+  *) exit 44 ;;
+esac
+SH
+chmod 700 "$TMP/fake-bin/curl"
+grok_out="$TMP/grok-once.out"
+grok_err="$TMP/grok-once.err"
+PATH="$TMP/fake-bin:$PATH" GROK_PROBE_LOG="$TMP/grok-request.log" HOME="$grok_home" \
+  QQ_PROFILE_BIN="$TMP/fake-bin/profile-fail" "$ROOT/bin/qq-dashboard" --once \
+  >"$grok_out" 2>"$grok_err"
+cmp "$TMP/grok-auth-before" "$grok_auth"
+grok_cache="$grok_home/.local/state/qq/telemetry/usage-cache.json"
+grep -Fq '37%' "$grok_out"
+if grep -Fq '52%' "$grok_out"; then
+  echo 'Grok test encoded the live diagnosis value' >&2
+  exit 1
+fi
+[[ "$(cat "$TMP/grok-request.log")" == grok-request-ok ]]
+jq -e '
+  .providers[0].state == "ready" and
+  .providers[1].state == "ready" and
+  .providers[1].meters[0].usedRatio == 0.37 and
+  .providers[1].meters[0].resetAt == 2000000000000 and
+  .providers[2].state == "unavailable"
+' "$grok_cache" >/dev/null
+[[ "$(stat -c %a "$grok_cache")" == 600 ]]
+if grep -REq 'dedicated-e2e-token|private-refresh|raw-billing-marker|\.qq-grok-auth\.json' \
+    "$grok_out" "$grok_err" "$grok_cache" "$TMP/grok-request.log"; then
+  echo 'Grok producer leaked credential, payload, or credential path' >&2
+  exit 1
+fi
+
+# A present but malformed dedicated store fails closed instead of falling back
+# to Pi. Codex and Qwen rows still complete normally.
+printf '%s\n' '{malformed' >"$grok_auth"
+PATH="$TMP/fake-bin:$PATH" GROK_PROBE_LOG="$TMP/grok-request.log" HOME="$grok_home" \
+  QQ_PROFILE_BIN="$TMP/fake-bin/profile-fail" "$ROOT/bin/qq-dashboard" --once \
+  >"$TMP/grok-rejected.out" 2>"$TMP/grok-rejected.err"
+[[ "$(wc -l <"$TMP/grok-request.log")" == 1 ]]
+jq -e '
+  .providers[0].state == "ready" and
+  .providers[1].state == "unavailable" and
+  .providers[1].observedAt == null and
+  (.providers[1].meters | length) == 0 and
+  .providers[2].state == "unavailable"
+' "$grok_cache" >/dev/null
+if grep -REq 'legacy-must-not-bypass|\.qq-grok-auth\.json' \
+    "$TMP/grok-rejected.out" "$TMP/grok-rejected.err" "$grok_cache"; then
+  echo 'rejected Grok credential leaked or used legacy fallback' >&2
+  exit 1
+fi
 
 structured_qwen=$(HOME="$TMP/home" bash -c '
   source "$1"
