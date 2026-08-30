@@ -1,5 +1,6 @@
 import { createDashboardCache } from "./service.mjs";
 import { defaultUsageCachePath, readUsageCache } from "./usage-cache.mjs";
+import { createUsageProducerSupervisor } from "./usage-producer.mjs";
 
 export const name = "qq-dashboard";
 export const inject = ["qq-core"];
@@ -13,10 +14,12 @@ function refreshCadence(value) {
 export function apply(ctx, config = {}) {
   const core = ctx.get?.("qq-core");
   const hasStaticUsage = Object.prototype.hasOwnProperty.call(config, "usage");
+  const hasInjectedUsageFor = typeof config.usageFor === "function";
+  const defaultUsageFile = defaultUsageCachePath();
   const usageFile = typeof config.usageFile === "string"
     ? config.usageFile
-    : defaultUsageCachePath();
-  const usageFor = typeof config.usageFor === "function"
+    : defaultUsageFile;
+  const usageFor = hasInjectedUsageFor
     ? config.usageFor
     : hasStaticUsage || !usageFile ? null : () => readUsageCache(usageFile);
   const cache = createDashboardCache({
@@ -32,6 +35,23 @@ export function apply(ctx, config = {}) {
   ctx.provide("qq-dashboard", cache.service);
 
   const disposers = [];
+  // Custom usage paths are test/embedder inputs: the bundled producer owns only
+  // the exact HOME-relative cache path and must never be pointed elsewhere.
+  const ownsDefaultUsage = usageFile && usageFile === defaultUsageFile;
+  const hasInjectedProducer = typeof config.usageProducerFor === "function";
+  if (!hasStaticUsage && !hasInjectedUsageFor && config.produceUsage !== false
+    && (ownsDefaultUsage || hasInjectedProducer)) {
+    const producerFor = hasInjectedProducer
+      ? config.usageProducerFor
+      : createUsageProducerSupervisor;
+    try {
+      const producer = producerFor({
+        onUpdate: () => { void cache.forceUsageRead(); },
+      });
+      const stop = typeof producer === "function" ? producer : producer?.dispose;
+      if (typeof stop === "function") disposers.push(() => stop.call(producer));
+    } catch {}
+  }
   if (typeof ctx.on === "function") {
     for (const event of ["agent/created", "agent/status", "agent/disposed"]) {
       const off = ctx.on(event, () => { void cache.refresh(); });

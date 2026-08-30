@@ -54,9 +54,10 @@ export function createDashboardCache({
   let current = projectSnapshot({ generatedAt: initialAt, usage: usageCache });
   let queued = false;
   let queuedWorkflow = false;
+  let queuedUsage = false;
   let active = null;
 
-  async function update({ refreshWorkflows }) {
+  async function update({ refreshWorkflows, forceUsage }) {
     const at = timestamp(now);
 
     // Capture both core authorities as one pair. A transient or malformed read
@@ -90,7 +91,7 @@ export function createDashboardCache({
       ? usageRefreshMs
       : DEFAULT_USAGE_REFRESH_MS;
     if (typeof usageFor === "function"
-      && (!usageObserved || at - lastUsageAt >= usageCadence)) {
+      && (forceUsage || !usageObserved || at - lastUsageAt >= usageCadence)) {
       usageObserved = true;
       lastUsageAt = at;
       try {
@@ -111,16 +112,19 @@ export function createDashboardCache({
     return current;
   }
 
-  function schedule(refreshWorkflows) {
+  function schedule(refreshWorkflows, forceUsage = false) {
     queued = true;
     queuedWorkflow ||= refreshWorkflows;
+    queuedUsage ||= forceUsage;
     if (!active) {
       active = (async () => {
         while (queued) {
           const full = queuedWorkflow;
+          const forcedUsage = queuedUsage;
           queued = false;
           queuedWorkflow = false;
-          await update({ refreshWorkflows: full });
+          queuedUsage = false;
+          await update({ refreshWorkflows: full, forceUsage: forcedUsage });
         }
         return current;
       })().finally(() => { active = null; });
@@ -136,13 +140,17 @@ export function createDashboardCache({
     return schedule(false);
   }
 
+  function forceUsageRead() {
+    return schedule(false, true);
+  }
+
   const service = Object.freeze({
     /** Synchronous, side-effect-free and I/O-free cached projection. */
     snapshot() { return current; },
   });
 
   const ready = refresh();
-  return Object.freeze({ service, refresh, tick, ready });
+  return Object.freeze({ service, refresh, tick, forceUsageRead, ready });
 }
 
 export const defaults = Object.freeze({

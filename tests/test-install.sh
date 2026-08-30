@@ -11,9 +11,20 @@ chmod 700 "$TMP"
 # tracked sources under test. Every install and HOME remains under TMP.
 product_source="$TMP/product-source"
 mkdir -m 700 "$product_source"
-git -C "$ROOT" ls-files -z \
-  | (cd "$ROOT" && tar --null --files-from=- -cf -) \
-  | (cd "$product_source" && tar -xf -)
+if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$ROOT" ls-files -z --cached --others --exclude-standard \
+    | (cd "$ROOT" && tar --null --files-from=- -cf -) \
+    | (cd "$product_source" && tar -xf -)
+else
+  # Some sandbox runners expose the source overlay without discoverable Git
+  # metadata. Copy that exact working tree, then create the isolated repository
+  # used by every installer assertion below.
+  (cd "$ROOT" && tar -cf - .gitignore README.md bin install.sh package.json src tests) \
+    | (cd "$product_source" && tar -xf -)
+fi
+# The agent workspace may export an outer worktree explicitly. The remaining
+# suite owns an isolated nested repository and must not redirect Git there.
+unset GIT_DIR GIT_WORK_TREE
 git -C "$product_source" init -q -b main
 git -C "$product_source" config user.name qq-dashboard-test
 git -C "$product_source" config user.email qq-dashboard-test@example.invalid
@@ -41,6 +52,7 @@ default_root="$test_home/.local/lib/qq/dashboard"
 [[ -f "$default_root/src/service.mjs" ]]
 [[ -f "$default_root/src/snapshot.mjs" ]]
 [[ -f "$default_root/src/usage-cache.mjs" ]]
+[[ -f "$default_root/src/usage-producer.mjs" ]]
 [[ $(<"$default_root/share/qq-dashboard/source-commit") == "$product_commit" ]]
 node --input-type=module - "$default_root" <<'NODE'
 import assert from "node:assert/strict";
@@ -52,7 +64,7 @@ assert.equal(plugin.provide, "qq-dashboard");
 NODE
 HOME="$test_home" "$default_root/bin/qq-dashboard" --help >"$TMP/dashboard-help"
 HOME="$test_home" "$default_root/bin/qq-dashboard-cookies" --help >"$TMP/cookies-help"
-grep -Fq 'Usage: qq-dashboard [--once] [--help]' "$TMP/dashboard-help"
+grep -Fq 'Usage: qq-dashboard [--once|--headless] [--help]' "$TMP/dashboard-help"
 grep -Fq 'Usage: qq-dashboard-cookies <refresh|status|validate> [--help]' "$TMP/cookies-help"
 formatted=$(HOME="$test_home" bash -c 'source "$1"; fmt_num 1234567' \
   _ "$default_root/bin/qq-dashboard")
@@ -128,6 +140,7 @@ QQ_DASHBOARD_INSTALL_ROOT="$override_root" "$product_source/install.sh" \
 [[ -f "$override_root/package.json" ]]
 [[ -f "$override_root/src/plugin.mjs" ]]
 [[ -f "$override_root/src/usage-cache.mjs" ]]
+[[ -f "$override_root/src/usage-producer.mjs" ]]
 [[ $(<"$override_root/share/qq-dashboard/source-commit") == "$upgrade_commit" ]]
 [[ ! -e "$TMP/.local/state/qq/telemetry" ]]
 

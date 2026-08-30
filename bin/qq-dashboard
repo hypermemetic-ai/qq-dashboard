@@ -100,18 +100,22 @@ exhausted_flag() {
 
 usage() {
   cat <<'EOF'
-Usage: qq-dashboard [--once] [--help]
+Usage: qq-dashboard [--once|--headless] [--help]
 
 Render QQ provider plans, usage, and execution profiles.
-  --once  Fetch and render one screen, then exit.
-  --help  Show this help.
+  --once     Fetch and render one screen, then exit.
+  --headless Continuously publish the non-secret usage cache without a frame.
+  --help     Show this help.
 
-Interactive mode refreshes every 30 seconds by default; press r to refresh or
-q to quit. Set TELEMETRY_REFRESH and TELEMETRY_QWEN_GW_CADENCE to tune cadence.
+Interactive and headless modes refresh every 30 seconds by default; press r to
+refresh or q to quit in interactive mode. Set TELEMETRY_REFRESH and
+TELEMETRY_QWEN_GW_CADENCE to tune cadence.
 EOF
 }
 
 ONCE=0
+HEADLESS=0
+USAGE_UPDATE_SIGNAL='qq-dashboard:usage-cache-updated'
 
 # Per-provider display state.
 GPT_WEEK='7d       unavailable'
@@ -784,7 +788,7 @@ fetch_all() {
   local codex_file codex_body=''
   local -a pids=()
   local grok_access grok_file grok_body=''
-  load_roles
+  [ "$HEADLESS" = 1 ] || load_roles
   GPT_WEEK='7d       unavailable'
   GROK_WEEK='7d       unavailable'
   CODEX_USAGE_STATE=unavailable
@@ -922,6 +926,16 @@ persist_usage_cache() {
   USAGE_CACHE_TMP=''
 }
 
+headless_cycle() {
+  fetch_all || return 65
+  if persist_usage_cache; then
+    # This exact fixed line is the entire headless stdout protocol. The Cordis
+    # owner treats anything else as malformed and never logs child output.
+    printf '%s\n' "$USAGE_UPDATE_SIGNAL"
+  fi
+  return 0
+}
+
 render() {
   local frame
   persist_usage_cache || true
@@ -958,8 +972,9 @@ render_body() {
 
 qq_dashboard_main() {
   case "${1:-}" in
-    '') ONCE=0 ;;
-    --once) ONCE=1 ;;
+    '') ONCE=0; HEADLESS=0 ;;
+    --once) ONCE=1; HEADLESS=0 ;;
+    --headless) ONCE=0; HEADLESS=1 ;;
     --help|-h) usage; return 0 ;;
     *) usage >&2; return 2 ;;
   esac
@@ -973,6 +988,13 @@ qq_dashboard_main() {
     fetch_all || return 65
     render
     return 0
+  fi
+
+  if [ "$HEADLESS" = 1 ]; then
+    while true; do
+      headless_cycle || return $?
+      sleep "$REFRESH_SECS"
+    done
   fi
 
   # Paint the last persisted frame immediately so the pane is never blank
