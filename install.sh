@@ -69,6 +69,7 @@ install -D -m 0644 "$source_root/README.md" "$stage/README.md"
 install -D -m 0644 "$source_root/src/plugin.mjs" "$stage/src/plugin.mjs"
 install -D -m 0644 "$source_root/src/service.mjs" "$stage/src/service.mjs"
 install -D -m 0644 "$source_root/src/snapshot.mjs" "$stage/src/snapshot.mjs"
+install -D -m 0644 "$source_root/src/usage-cache.mjs" "$stage/src/usage-cache.mjs"
 install -D -m 0644 /dev/null "$stage/share/qq-dashboard/source-commit"
 printf '%s\n' "$source_commit" >"$stage/share/qq-dashboard/source-commit"
 
@@ -79,6 +80,7 @@ printf '%s\n' "$source_commit" >"$stage/share/qq-dashboard/source-commit"
   && -f "$stage/src/plugin.mjs" \
   && -f "$stage/src/service.mjs" \
   && -f "$stage/src/snapshot.mjs" \
+  && -f "$stage/src/usage-cache.mjs" \
   && $(<"$stage/share/qq-dashboard/source-commit") == "$source_commit" ]] \
   || fail "staged artifact is incomplete"
 

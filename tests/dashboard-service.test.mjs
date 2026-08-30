@@ -561,6 +561,7 @@ test("Cordis plugin provides an optional cached surface and disposes listeners/t
   assert.equal(provide, "qq-dashboard");
   assert.deepEqual(inject, ["qq-core"]);
   assert.equal(cacheDefaults.workflowRefreshMs, 30_000);
+  assert.equal(cacheDefaults.usageRefreshMs, 30_000);
 
   let status = "idle";
   let agentCalls = 0;
@@ -606,7 +607,7 @@ test("Cordis plugin provides an optional cached surface and disposes listeners/t
     effect(factory) { effects.push(factory()); },
   };
 
-  const disposeReturned = apply(ctx, { refreshMs: 50 });
+  const disposeReturned = apply(ctx, { refreshMs: 50, usage: { generatedAt: 0, providers: [] } });
   const service = provided.get("qq-dashboard");
   assert.ok(service);
   await waitFor(() => service.snapshot().projects.length === 1, "initial background refresh did not publish");
@@ -670,4 +671,58 @@ test("required core and malformed optional inputs fail or degrade safely", async
   await cache.ready;
   assert.deepEqual(cache.service.snapshot().projects, []);
   assert.deepEqual(cache.service.snapshot().usage.providers, []);
+});
+
+
+test("usage source reads on its own cadence and retains the last valid cache", async () => {
+  let now = 1_000;
+  let usageCalls = 0;
+  let mode = "first";
+  const usageFor = async () => {
+    usageCalls += 1;
+    if (mode === "throw") throw new Error("temporary cache read failure");
+    if (mode === "missing") return null;
+    return {
+      generatedAt: mode === "first" ? 900 : 30_900,
+      providers: [{
+        id: "codex", label: "Codex", state: "ready", observedAt: 800,
+        meters: [{ id: "weekly", label: "7d", usedRatio: mode === "first" ? 0.2 : 0.4,
+          resetAt: 50_000, detail: "" }],
+      }],
+    };
+  };
+  const cache = createDashboardCache({
+    core: { listAgents() { return []; }, async list() { return []; } },
+    usageFor,
+    usageRefreshMs: 30_000,
+    now: () => now,
+  });
+  await cache.ready;
+  assert.equal(usageCalls, 1);
+  assert.equal(cache.service.snapshot().usage.providers[0].meters[0].usedRatio, 0.2);
+  const published = cache.service.snapshot();
+  cache.service.snapshot();
+  assert.strictEqual(cache.service.snapshot(), published);
+  assert.equal(usageCalls, 1, "snapshot never reads the file source");
+
+  now += 29_999;
+  await cache.tick();
+  assert.equal(usageCalls, 1);
+  mode = "second";
+  now += 1;
+  await cache.tick();
+  assert.equal(usageCalls, 2);
+  assert.equal(cache.service.snapshot().usage.providers[0].meters[0].usedRatio, 0.4);
+
+  mode = "throw";
+  now += 30_000;
+  await cache.refresh();
+  assert.equal(usageCalls, 3, "lifecycle refresh reads usage only when its cadence is due");
+  assert.equal(cache.service.snapshot().usage.providers[0].meters[0].usedRatio, 0.4,
+    "read failure retains the last valid usage snapshot");
+  mode = "missing";
+  now += 30_000;
+  await cache.tick();
+  assert.equal(cache.service.snapshot().usage.providers[0].meters[0].usedRatio, 0.4,
+    "missing cache retains the last valid usage snapshot");
 });

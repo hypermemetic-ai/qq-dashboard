@@ -40,6 +40,7 @@ default_root="$test_home/.local/lib/qq/dashboard"
 [[ -f "$default_root/src/plugin.mjs" ]]
 [[ -f "$default_root/src/service.mjs" ]]
 [[ -f "$default_root/src/snapshot.mjs" ]]
+[[ -f "$default_root/src/usage-cache.mjs" ]]
 [[ $(<"$default_root/share/qq-dashboard/source-commit") == "$product_commit" ]]
 node --input-type=module - "$default_root" <<'NODE'
 import assert from "node:assert/strict";
@@ -126,6 +127,7 @@ QQ_DASHBOARD_INSTALL_ROOT="$override_root" "$product_source/install.sh" \
 [[ -f "$override_root/bin/lib/telemetry-lib.sh" ]]
 [[ -f "$override_root/package.json" ]]
 [[ -f "$override_root/src/plugin.mjs" ]]
+[[ -f "$override_root/src/usage-cache.mjs" ]]
 [[ $(<"$override_root/share/qq-dashboard/source-commit") == "$upgrade_commit" ]]
 [[ ! -e "$TMP/.local/state/qq/telemetry" ]]
 

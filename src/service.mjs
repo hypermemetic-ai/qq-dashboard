@@ -1,6 +1,7 @@
 import { normalizeUsage, projectSnapshot } from "./snapshot.mjs";
 
 const DEFAULT_WORKFLOW_REFRESH_MS = 30_000;
+const DEFAULT_USAGE_REFRESH_MS = 30_000;
 
 function optional(getter) {
   if (typeof getter !== "function") return null;
@@ -34,18 +35,22 @@ export function createDashboardCache({
   workflows,
   now = Date.now,
   workflowRefreshMs = DEFAULT_WORKFLOW_REFRESH_MS,
+  usageRefreshMs = DEFAULT_USAGE_REFRESH_MS,
   usage,
+  usageFor,
 } = {}) {
   if (!core || typeof core.listAgents !== "function" || typeof core.list !== "function") {
     throw new TypeError("qq-dashboard: qq-core listAgents/list service is required");
   }
   const initialAt = timestamp(now);
-  const usageCache = normalizeUsage(usage, initialAt);
+  let usageCache = normalizeUsage(usage, initialAt);
   let agents = [];
   let projectRows = [];
   let workflowsCache = [];
   let workflowObserved = false;
   let lastWorkflowAt = -Infinity;
+  let usageObserved = false;
+  let lastUsageAt = -Infinity;
   let current = projectSnapshot({ generatedAt: initialAt, usage: usageCache });
   let queued = false;
   let queuedWorkflow = false;
@@ -80,6 +85,21 @@ export function createDashboardCache({
       workflowObserved = true;
       lastWorkflowAt = at;
       workflowsCache = workflowRows(optional(workflows));
+    }
+    const usageCadence = Number.isFinite(usageRefreshMs) && usageRefreshMs >= 0
+      ? usageRefreshMs
+      : DEFAULT_USAGE_REFRESH_MS;
+    if (typeof usageFor === "function"
+      && (!usageObserved || at - lastUsageAt >= usageCadence)) {
+      usageObserved = true;
+      lastUsageAt = at;
+      try {
+        const nextUsage = await usageFor();
+        if (nextUsage && typeof nextUsage === "object" && !Array.isArray(nextUsage)
+          && Number.isFinite(nextUsage.generatedAt) && Array.isArray(nextUsage.providers)) {
+          usageCache = normalizeUsage(nextUsage, at);
+        }
+      } catch {}
     }
     current = projectSnapshot({
       generatedAt: at,
@@ -127,4 +147,5 @@ export function createDashboardCache({
 
 export const defaults = Object.freeze({
   workflowRefreshMs: DEFAULT_WORKFLOW_REFRESH_MS,
+  usageRefreshMs: DEFAULT_USAGE_REFRESH_MS,
 });

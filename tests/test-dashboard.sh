@@ -142,11 +142,18 @@ provider_frame=$(HOME="$TMP/provider-home" QQ_PROFILE_BIN="$TMP/fake-bin/profile
       if [[ "$1" == *chatgpt* ]]; then
         printf "%s\n" '\''{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000}}}'\''
       else
-        printf "%s\n" '\''{"config":{"creditUsagePercent":30}}'\''
+        printf "%s\n" '\''{"config":{"creditUsagePercent":30,"currentPeriod":{"end":"2033-05-18T03:33:20Z"}}}'\''
       fi
     }
-    qwen_update() { QWEN_L1="7d       live"; QWEN_L2=""; }
+    qwen_update() {
+      QWEN_L1="7d       live"; QWEN_L2=""
+      QWEN_USAGE_STATE=ready; QWEN_USAGE_OBSERVED_AT=1900000000000
+      QWEN_WEEKLY_RATIO=.5; QWEN_WEEKLY_RESET_AT=2000000000000
+      QWEN_WEEKLY_DETAIL="20000 / 40000"
+      QWEN_FIVE_RATIO=""; QWEN_FIVE_RESET_AT=""; QWEN_FIVE_DETAIL=""
+    }
     fetch_all
+    persist_usage_cache
     render_body
   ' _ "$ROOT/bin/qq-dashboard" 2>"$TMP/profile-fail.err")
 provider_plain=$(printf '%s' "$provider_frame" | sed 's/\x1b\[[0-9;]*m//g')
@@ -155,6 +162,56 @@ provider_plain=$(printf '%s' "$provider_frame" | sed 's/\x1b\[[0-9;]*m//g')
 [[ "$provider_plain" == *'Qwen'*'live'* ]]
 [[ "$provider_plain" == *'Execution profiles'*'unavailable'* ]]
 [[ "$(cat "$TMP/profile-fail.err")" == 'qq-dashboard: execution profiles unavailable from qq-profile' ]]
+usage_cache="$TMP/provider-home/.local/state/qq/telemetry/usage-cache.json"
+jq -e '
+  .schema == "qq.dashboard-usage/v1" and
+  (.generatedAt | type == "number") and
+  ([.providers[].id] == ["codex", "grok", "qwen"]) and
+  (.providers[0].state == "ready" and .providers[0].meters[0].usedRatio == 0.25 and
+    .providers[0].meters[0].resetAt == 2000000000000) and
+  (.providers[1].state == "ready" and .providers[1].meters[0].usedRatio == 0.3 and
+    .providers[1].meters[0].resetAt == 2000000000000) and
+  (.providers[2].state == "ready" and .providers[2].meters[0].usedRatio == 0.5)
+' "$usage_cache" >/dev/null
+[[ "$(stat -c %a "$usage_cache")" == 600 ]]
+! grep -Eq 'codex-access|codex-account|grok-access|runner|profile' "$usage_cache"
+! grep -q $'\033' "$usage_cache"
+
+structured_qwen=$(HOME="$TMP/home" bash -c '
+  source "$1"
+  qwen_render_rows 0.25 2000000000000 0.5 1999990000000 40000 12000 1 "5m ago" 1900000000 stale
+  printf "%s\n" "$QWEN_USAGE_STATE|$QWEN_USAGE_OBSERVED_AT|$QWEN_WEEKLY_RATIO|$QWEN_WEEKLY_RESET_AT|$QWEN_FIVE_RATIO"
+' _ "$ROOT/bin/qq-dashboard")
+[[ "$structured_qwen" == 'stale|1900000000000|0.25|2000000000000|0.5' ]]
+
+estimated_qwen=$(HOME="$TMP/home" bash -c '
+  source "$1"
+  QWEN_MTR_CADENCE=0
+  qwen_gateway_state_load() {
+    QWEN_RATE=.01; QWEN_ANCHOR_TS=800; QWEN_ANCHOR_TOKENS=100
+    QWEN_ANCHOR_CREDITS=10; QWEN_ANCHOR_RESET=2000000000000
+    QWEN_PERSISTED_TS=900; QWEN_PERSISTED_P1W=.25; QWEN_PERSISTED_P1WR=2000000000000
+    QWEN_PERSISTED_P5=.1; QWEN_PERSISTED_P5R=1999990000000
+    QWEN_PERSISTED_CEILW=40; QWEN_PERSISTED_CEIL5=20
+  }
+  qwen_meter() {
+    QWEN_MTR_T7=200; QWEN_MTR_T5=50; QWEN_METER_AVAILABLE=1; QWEN_METER_INIT=1
+  }
+  qwen_cookie_args() { return 1; }
+  qwen_update 1000
+  printf "%s\n" "$QWEN_USAGE_STATE|$QWEN_USAGE_OBSERVED_AT|$QWEN_WEEKLY_RATIO|$QWEN_WEEKLY_RESET_AT|$QWEN_WEEKLY_DETAIL"
+' _ "$ROOT/bin/qq-dashboard")
+[[ "$estimated_qwen" == 'estimated|900000|0.275|2000000000000|11 / 40 estimated' ]]
+
+preserved=$(HOME="$TMP/home" bash -c '
+  source "$1"
+  mkdir -p -- "$(dirname -- "$USAGE_CACHE")"
+  printf "prior\n" >"$USAGE_CACHE"
+  jq() { return 1; }
+  persist_usage_cache || true
+  cat -- "$USAGE_CACHE"
+' _ "$ROOT/bin/qq-dashboard")
+[[ "$preserved" == prior ]]
 
 malformed_frame=$(HOME="$TMP/provider-home" QQ_PROFILE_BIN="$TMP/fake-bin/profile-malformed" \
   "$ROOT/bin/qq-dashboard" --once 2>"$TMP/profile-malformed.err")
@@ -163,5 +220,13 @@ malformed_plain=$(printf '%s' "$malformed_frame" | sed 's/\x1b\[[0-9;]*m//g')
 [[ "$malformed_plain" == *'Grok'* ]]
 [[ "$malformed_plain" == *'Qwen'* ]]
 [[ "$malformed_plain" == *'Execution profiles'*'unavailable'* ]]
+jq -e '
+  .schema == "qq.dashboard-usage/v1" and
+  ([.providers[].id] == ["codex", "grok", "qwen"]) and
+  ([.providers[].state] | all(. == "unavailable")) and
+  ([.providers[].observedAt] | all(. == null)) and
+  ([.providers[].meters] | all(length == 0))
+' "$usage_cache" >/dev/null
+! grep -Eq 'codex-access|codex-account|grok-access' "$usage_cache"
 
 echo 'test-dashboard: pass'

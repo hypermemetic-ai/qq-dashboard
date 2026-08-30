@@ -1,0 +1,86 @@
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+
+import { normalizeUsage } from "./snapshot.mjs";
+
+export const USAGE_CACHE_SCHEMA = "qq.dashboard-usage/v1";
+export const MAX_USAGE_CACHE_BYTES = 131_072;
+const STATES = new Set(["ready", "estimated", "stale", "unavailable"]);
+const PROVIDERS = new Set(["codex", "grok", "qwen"]);
+const PROVIDER_LABELS = new Map([["codex", "Codex"], ["grok", "Grok"], ["qwen", "Qwen"]]);
+
+function epoch(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function nonempty(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function validEnvelope(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
+    || candidate.schema !== USAGE_CACHE_SCHEMA || !epoch(candidate.generatedAt)
+    || !Array.isArray(candidate.providers) || candidate.providers.length !== PROVIDERS.size) return false;
+  const providers = new Set();
+  for (const provider of candidate.providers) {
+    if (!provider || typeof provider !== "object" || Array.isArray(provider)
+      || !PROVIDERS.has(provider.id) || providers.has(provider.id)
+      || provider.label !== PROVIDER_LABELS.get(provider.id) || !STATES.has(provider.state)
+      || (provider.id !== "qwen" && provider.state !== "ready" && provider.state !== "unavailable")
+      || !(provider.observedAt === null || epoch(provider.observedAt))
+      || !Array.isArray(provider.meters)) return false;
+    providers.add(provider.id);
+    if (provider.state === "unavailable") {
+      if (provider.observedAt !== null || provider.meters.length !== 0) return false;
+    } else if (provider.observedAt === null || provider.meters.length === 0) {
+      return false;
+    }
+    const meters = new Set();
+    for (const meter of provider.meters) {
+      if (!meter || typeof meter !== "object" || Array.isArray(meter)
+        || !nonempty(meter.id) || meters.has(meter.id) || !nonempty(meter.label)
+        || !Number.isFinite(meter.usedRatio) || meter.usedRatio < 0
+        || !(meter.resetAt === null || epoch(meter.resetAt))
+        || typeof meter.detail !== "string") return false;
+      meters.add(meter.id);
+      if (provider.id === "qwen") {
+        if ((meter.id !== "weekly" && meter.id !== "five-hour")
+          || (meter.id === "weekly" && meter.label !== "7d")
+          || (meter.id === "five-hour" && meter.label !== "5h")) return false;
+        if (!/^\d+ \/ \d+( estimated)?$/.test(meter.detail)
+          || (provider.state === "estimated") !== meter.detail.endsWith(" estimated")) return false;
+      } else if (meter.id !== "weekly" || meter.label !== "7d" || meter.detail !== "") {
+        return false;
+      }
+    }
+    if (provider.state !== "unavailable"
+      && (!meters.has("weekly") || (provider.id !== "qwen" && meters.size !== 1))) return false;
+  }
+  return providers.size === PROVIDERS.size;
+}
+
+export function defaultUsageCachePath(env = process.env) {
+  const home = typeof env?.HOME === "string" ? env.HOME : "";
+  return isAbsolute(home) ? join(home, ".local/state/qq/telemetry/usage-cache.json") : null;
+}
+
+/** Read and isolate one producer-owned, non-secret usage cache snapshot. */
+export async function readUsageCache(filePath) {
+  if (typeof filePath !== "string" || !isAbsolute(filePath)) return null;
+  let handle;
+  try {
+    const noFollow = constants.O_NOFOLLOW ?? 0;
+    handle = await open(filePath, constants.O_RDONLY | noFollow);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_USAGE_CACHE_BYTES) return null;
+    const raw = await handle.readFile({ encoding: "utf8" });
+    const candidate = JSON.parse(raw);
+    if (!validEnvelope(candidate)) return null;
+    return normalizeUsage(candidate, candidate.generatedAt);
+  } catch {
+    return null;
+  } finally {
+    try { await handle?.close(); } catch {}
+  }
+}

@@ -8,7 +8,7 @@
     "qq-dashboard-cookies": "bin/qq-dashboard-cookies"
   },
   "scripts": {
-    "check": "node --check src/plugin.mjs && node --check src/service.mjs && node --check src/snapshot.mjs",
+    "check": "node --check src/plugin.mjs && node --check src/service.mjs && node --check src/snapshot.mjs && node --check src/usage-cache.mjs",
     "test": "npm run check && node --test tests/*.test.mjs && tests/test-dashboard.sh && tests/test-install.sh"
   },
   "description": "Cached, presentation-neutral QQ live operator snapshot and terminal provider dashboard.",
@@ -16,7 +16,8 @@
   "exports": {
     ".": "./src/plugin.mjs",
     "./service": "./src/service.mjs",
-    "./snapshot": "./src/snapshot.mjs"
+    "./snapshot": "./src/snapshot.mjs",
+    "./usage-cache": "./src/usage-cache.mjs"
   },
   "files": [
     "src/",

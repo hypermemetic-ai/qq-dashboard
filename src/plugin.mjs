@@ -1,4 +1,5 @@
 import { createDashboardCache } from "./service.mjs";
+import { defaultUsageCachePath, readUsageCache } from "./usage-cache.mjs";
 
 export const name = "qq-dashboard";
 export const inject = ["qq-core"];
@@ -11,13 +12,21 @@ function refreshCadence(value) {
 /** Provide the cached live operator snapshot to in-process presentation plugins. */
 export function apply(ctx, config = {}) {
   const core = ctx.get?.("qq-core");
+  const hasStaticUsage = Object.prototype.hasOwnProperty.call(config, "usage");
+  const usageFile = typeof config.usageFile === "string"
+    ? config.usageFile
+    : defaultUsageCachePath();
+  const usageFor = typeof config.usageFor === "function"
+    ? config.usageFor
+    : hasStaticUsage || !usageFile ? null : () => readUsageCache(usageFile);
   const cache = createDashboardCache({
     core,
     workflows: () => ctx.get?.("qq-workflows", false) ?? null,
     now: typeof config.now === "function" ? config.now : Date.now,
     workflowRefreshMs: config.workflowRefreshMs,
-    // Optional static non-secret display rows only. No provider refresh or
-    // credentials cross this plugin boundary.
+    usageRefreshMs: config.usageRefreshMs,
+    usageFor,
+    // Optional static non-secret display rows suppress the default file reader.
     usage: config.usage,
   });
   ctx.provide("qq-dashboard", cache.service);
