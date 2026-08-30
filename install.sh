@@ -66,6 +66,7 @@ install -D -m 0755 "$source_root/bin/qq-dashboard-cookies" "$stage/bin/qq-dashbo
 install -D -m 0644 "$source_root/bin/lib/telemetry-lib.sh" "$stage/bin/lib/telemetry-lib.sh"
 install -D -m 0644 "$source_root/package.json" "$stage/package.json"
 install -D -m 0644 "$source_root/README.md" "$stage/README.md"
+install -D -m 0644 "$source_root/docs/provider-usage.md" "$stage/docs/provider-usage.md"
 install -D -m 0644 "$source_root/src/plugin.mjs" "$stage/src/plugin.mjs"
 install -D -m 0644 "$source_root/src/service.mjs" "$stage/src/service.mjs"
 install -D -m 0644 "$source_root/src/snapshot.mjs" "$stage/src/snapshot.mjs"
@@ -78,6 +79,7 @@ printf '%s\n' "$source_commit" >"$stage/share/qq-dashboard/source-commit"
   && -x "$stage/bin/qq-dashboard-cookies" \
   && -f "$stage/bin/lib/telemetry-lib.sh" \
   && -f "$stage/package.json" \
+  && -f "$stage/docs/provider-usage.md" \
   && -f "$stage/src/plugin.mjs" \
   && -f "$stage/src/service.mjs" \
   && -f "$stage/src/snapshot.mjs" \

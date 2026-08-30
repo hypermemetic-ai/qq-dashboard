@@ -94,78 +94,16 @@ ctx.get("qq-workflows", false)?.workflows?.snapshots()
 // [{ sessionUuid, workflow, phase, phaseStartedAt }]
 ```
 
-Structured provider usage is a strict non-secret display cache shared by the
-shell producer and optional in-process reader. After every fetched `--once` or
-interactive frame, and after every cache-only headless cycle, `qq-dashboard`
-atomically replaces this file with mode `0600`:
+## Provider usage
 
-```text
-~/.local/state/qq/telemetry/usage-cache.json
-```
+The plugin supervises one shell-only `--headless` producer and reads its strict,
+non-secret display cache. Startup, retry, disposal/HMR, cache schema, provider
+prerequisites, and security boundaries are documented in
+[Provider usage](docs/provider-usage.md).
 
-The on-disk envelope is separate from the public dashboard schema:
-
-```js
-{
-  schema: "qq.dashboard-usage/v1",
-  generatedAt: 1788000000000,       // producer-cycle epoch milliseconds
-  providers: [{
-    id: "codex",
-    label: "Codex",
-    state: "ready",
-    observedAt: 1788000000000,
-    meters: [{
-      id: "weekly",
-      label: "7d",
-      usedRatio: 0.42,
-      resetAt: 1788600000000,
-      detail: ""
-    }]
-  }]
-}
-```
-
-A valid producer cycle contains Codex, Grok, and Qwen rows even when a provider
-is unavailable. States have exact display-cache meanings:
-
-- `ready`: a fresh provider reading;
-- `estimated`: a calibrated Qwen estimate derived from the local token meter;
-- `stale`: the last Qwen provider reading, still inside its quota window; and
-- `unavailable`: no usable reading for this cycle (`observedAt: null`, no
-  meters).
-
-All timestamps are epoch milliseconds or `null`. Stable meter identities are
-`weekly` / `7d` and, for Qwen when known, `five-hour` / `5h`. `usedRatio` is a
-nonnegative number and may exceed one. `detail` contains only neutral display
-text such as a Qwen used/limit value and an `estimated` marker.
-
-The plugin reads the file once during its initial owner refresh and then at most
-once per its independent 30-second usage cadence, plus a prompt read after an
-exact successful producer signal. It rejects symlinks, non-regular or oversized
-files, malformed JSON, wrong schemas, and invalid rows. Missing or rejected
-input starts empty and later preserves the last valid cache; it never suppresses
-live project/session state. A static `config.usage` remains available for
-embedders and tests and suppresses the default file reader unless an explicit
-`config.usageFor` is injected.
-
-With the default file reader, the plugin starts bundled `qq-dashboard
---headless` as one non-detached child. The child fetches immediately, then
-repeats at `TELEMETRY_REFRESH` (30 seconds by default) while retaining the
-existing process-local Qwen gateway cadence and calibration. It skips execution
-profiles and all frame/ANSI output. Its piped stdout protocol is only the fixed
-`qq-dashboard:usage-cache-updated` line after a successful atomic write; stdin
-is ignored and stderr is discarded. Unexpected exits restart after a bounded
-delay. Plugin disposal or HMR clears a pending restart and sends `SIGTERM` to
-the child, with no restart after disposal.
-
-The Node reader/supervisor never reads authentication or cookie stores, performs
-provider requests, or receives child diagnostics or payloads. Only the existing
-shell producer reads local credentials/cookies and provider endpoints. It
-serializes only the normalized fields above through a mode-`0600`,
-same-directory temporary file and atomic rename. Credentials, cookies, raw
-provider payloads, execution profiles, ANSI text, local paths, and profile data
-never cross the cache or stdout boundary. Serialization or write failure emits
-no signal and preserves the prior cache.
+Qwen gateway usage requires `qq-dashboard-cookies refresh` and explicit
+operator confirmation. A Firefox profile alone does not initialize Qwen, and
+the producer never bypasses this gate.
 
 ### Host composition
 
@@ -270,13 +208,13 @@ service. The terminal utilities need:
 - `qq-profile` on `PATH`, or an exact executable supplied through
   `QQ_PROFILE_BIN`, for interactive and `--once` profile rendering (not
   headless production);
-- Pi's local authorization and session stores for provider usage collection;
+- Pi's local authorization/session stores for Codex and the Qwen token meter;
+- qq-models' local OAuth store for Grok;
 - Python 3 and Firefox only when refreshing the Qwen browser-cookie snapshot.
 
-Provider credentials are read only by the shell producer's provider requests and
-are never displayed, passed as process arguments, or exposed to the Node
-service. Installation and upgrades do not touch the existing non-secret
-cache or Qwen cookie snapshot under `~/.local/state/qq/telemetry/`.
+Provider credentials stay in the shell producer and never enter Node, the cache,
+or the UI. Installation and upgrades do not touch existing telemetry state. See
+[the provider security boundary](docs/provider-usage.md#security-boundary).
 
 ## Validate
 

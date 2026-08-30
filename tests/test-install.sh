@@ -19,7 +19,7 @@ else
   # Some sandbox runners expose the source overlay without discoverable Git
   # metadata. Copy that exact working tree, then create the isolated repository
   # used by every installer assertion below.
-  (cd "$ROOT" && tar -cf - .gitignore README.md bin install.sh package.json src tests) \
+  (cd "$ROOT" && tar -cf - .gitignore README.md bin docs install.sh package.json src tests) \
     | (cd "$product_source" && tar -xf -)
 fi
 # The agent workspace may export an outer worktree explicitly. The remaining
@@ -48,6 +48,7 @@ default_root="$test_home/.local/lib/qq/dashboard"
 [[ -x "$default_root/bin/qq-dashboard-cookies" ]]
 [[ -f "$default_root/bin/lib/telemetry-lib.sh" ]]
 [[ -f "$default_root/package.json" ]]
+[[ -f "$default_root/docs/provider-usage.md" ]]
 [[ -f "$default_root/src/plugin.mjs" ]]
 [[ -f "$default_root/src/service.mjs" ]]
 [[ -f "$default_root/src/snapshot.mjs" ]]
@@ -138,6 +139,7 @@ QQ_DASHBOARD_INSTALL_ROOT="$override_root" "$product_source/install.sh" \
 [[ -x "$override_root/bin/qq-dashboard-cookies" ]]
 [[ -f "$override_root/bin/lib/telemetry-lib.sh" ]]
 [[ -f "$override_root/package.json" ]]
+[[ -f "$override_root/docs/provider-usage.md" ]]
 [[ -f "$override_root/src/plugin.mjs" ]]
 [[ -f "$override_root/src/usage-cache.mjs" ]]
 [[ -f "$override_root/src/usage-producer.mjs" ]]
