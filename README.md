@@ -16,7 +16,9 @@ poll observations.
 
 ## In-process service
 
-The package root is a Cordis plugin. Loading it calls:
+The package root is a Cordis plugin. Loading it provides the cached service and,
+by default, supervises one invisible cache-only usage producer for the same
+plugin lifetime:
 
 ```js
 ctx.provide("qq-dashboard", service);
@@ -77,11 +79,14 @@ serialized and burst-coalesced, so slow asynchronous `list()` reads never
 overlap or build an unbounded backlog. Timer refreshes reuse the last workflow
 aggregate and provider-usage file between their independent 30-second cadences;
 lifecycle events force a workflow aggregate refresh but never bypass the usage
-cadence. In particular, the UI's ~100 ms read cadence is never used to poll
-qq-core, workflow ledgers, or the filesystem. Therefore UI sheets may call `snapshot()`
-every ~100 ms without causing filesystem, network, credential, or subprocess
-work. A failed core refresh retains the last complete core pair, and optional
-workflow replacement or failure cannot suppress live session state. Architect
+cadence. A fixed successful-publication signal from the supervised producer is
+the one exception: it schedules an immediate strict cache read, serialized and
+coalesced with any active refresh, so a newly created file need not wait for the
+next cadence. In particular, the UI's ~100 ms read cadence is never used to poll
+qq-core, workflow ledgers, the filesystem, or a subprocess. Therefore UI sheets
+may call `snapshot()` every ~100 ms without causing filesystem, network,
+credential, or subprocess work. A failed core refresh retains the last complete
+core pair, and optional workflow replacement or failure cannot suppress live session state. Architect
 phase is consumed only from the fixed synchronous aggregate method:
 
 ```js
@@ -90,9 +95,9 @@ ctx.get("qq-workflows", false)?.workflows?.snapshots()
 ```
 
 Structured provider usage is a strict non-secret display cache shared by the
-terminal producer and optional in-process reader. After every fetched `--once`
-or interactive frame, `qq-dashboard` atomically replaces this file with mode
-`0600`:
+shell producer and optional in-process reader. After every fetched `--once` or
+interactive frame, and after every cache-only headless cycle, `qq-dashboard`
+atomically replaces this file with mode `0600`:
 
 ```text
 ~/.local/state/qq/telemetry/usage-cache.json
@@ -135,26 +140,43 @@ nonnegative number and may exceed one. `detail` contains only neutral display
 text such as a Qwen used/limit value and an `estimated` marker.
 
 The plugin reads the file once during its initial owner refresh and then at most
-once per its independent 30-second usage cadence. It rejects symlinks,
-non-regular or oversized files, malformed JSON, wrong schemas, and invalid
-rows. Missing or rejected input starts empty and later preserves the last valid
-cache; it never suppresses live project/session state. A static `config.usage`
-remains available for embedders and tests and suppresses the default file
-reader unless an explicit `config.usageFor` is injected.
+once per its independent 30-second usage cadence, plus a prompt read after an
+exact successful producer signal. It rejects symlinks, non-regular or oversized
+files, malformed JSON, wrong schemas, and invalid rows. Missing or rejected
+input starts empty and later preserves the last valid cache; it never suppresses
+live project/session state. A static `config.usage` remains available for
+embedders and tests and suppresses the default file reader unless an explicit
+`config.usageFor` is injected.
 
-The host-side reader never reads authentication or cookie stores, performs
-provider requests, or spawns the terminal command. The producer serializes only
-the normalized fields above and writes through a same-directory temporary file,
-so credentials, cookies, raw provider payloads, execution profiles, ANSI text,
-and local session paths never cross the service boundary. Running
-`qq-dashboard` is what creates and refreshes the web-visible cache.
+With the default file reader, the plugin starts bundled `qq-dashboard
+--headless` as one non-detached child. The child fetches immediately, then
+repeats at `TELEMETRY_REFRESH` (30 seconds by default) while retaining the
+existing process-local Qwen gateway cadence and calibration. It skips execution
+profiles and all frame/ANSI output. Its piped stdout protocol is only the fixed
+`qq-dashboard:usage-cache-updated` line after a successful atomic write; stdin
+is ignored and stderr is discarded. Unexpected exits restart after a bounded
+delay. Plugin disposal or HMR clears a pending restart and sends `SIGTERM` to
+the child, with no restart after disposal.
+
+The Node reader/supervisor never reads authentication or cookie stores, performs
+provider requests, or receives child diagnostics or payloads. Only the existing
+shell producer reads local credentials/cookies and provider endpoints. It
+serializes only the normalized fields above through a mode-`0600`,
+same-directory temporary file and atomic rename. Credentials, cookies, raw
+provider payloads, execution profiles, ANSI text, local paths, and profile data
+never cross the cache or stdout boundary. Serialization or write failure emits
+no signal and preserves the prior cache.
 
 ### Host composition
 
 The plugin requires `qq-core` and is itself optional to the host/UI. A host
 composition should load it after `qq-core` and before a UI that reads the
 service. Optional `qq-workflows` may be loaded, unloaded, or replaced at any
-time because it is resolved dynamically. Equivalent Cordis host metadata is:
+time because it is resolved dynamically. Automatic production is disabled when
+`config.usage` is present, an explicit `config.usageFor` is supplied, or
+`config.produceUsage === false`; this keeps deterministic embedders and tests
+free of subprocesses. Setting only `produceUsage: false` retains regular strict
+reads of a cache produced elsewhere. Equivalent Cordis host metadata is:
 
 ```yaml
 - id: qq-dashboard
@@ -177,11 +199,16 @@ compositions; this package does not mount HTTP routes.
 Pure consumers/tests may import `@hypermemetic-ai/qq-dashboard/snapshot`; cache
 owners may import `@hypermemetic-ai/qq-dashboard/service`. The strict file
 reader and path helper are exported from `@hypermemetic-ai/qq-dashboard/usage-cache`.
+The lifecycle supervisor and fixed signal are exported from
+`@hypermemetic-ai/qq-dashboard/usage-producer` for host-level testing; normal
+Cordis compositions should let the root plugin own it.
 
 ## Terminal commands
 
 ```text
-qq-dashboard [--once]
+qq-dashboard
+qq-dashboard --once
+qq-dashboard --headless
 qq-dashboard-cookies refresh
 qq-dashboard-cookies status
 qq-dashboard-cookies validate
@@ -193,8 +220,12 @@ The terminal page retains:
 - QQ architect, runner, scribe, and QA execution profiles.
 
 Interactive mode refreshes automatically. Press `r` to refresh immediately or
-`q` to quit. QQ remains the owner of execution-profile policy and runtime
-behavior; this surface consumes `qq-profile list --json`.
+`q` to quit. `--once` retains the fetched one-frame command. `--headless` is
+available for diagnostics and non-Cordis owners, but a normally loaded plugin
+already owns one instance and should not be paired with a duplicate manual
+producer. QQ remains the owner of execution-profile policy and runtime behavior;
+the interactive and `--once` surfaces consume `qq-profile list --json`, while
+headless mode deliberately does not.
 
 ## Check and install
 
@@ -225,8 +256,9 @@ QQ_DASHBOARD_INSTALL_ROOT=/absolute/path/to/dashboard ./install.sh
 ```
 
 The repository must still be clean and committed. Installation does not fetch
-source, mutate provider state, or manage a daemon. To upgrade, fast-forward the
-landed `main` checkout, run `npm test`, and install again.
+source, mutate provider state, or install an operating-system daemon. The
+loaded Cordis plugin owns its child producer directly. To upgrade, fast-forward
+the landed `main` checkout, run `npm test`, and install again.
 
 ## Runtime requirements
 
@@ -236,12 +268,14 @@ service. The terminal utilities need:
 - Bash;
 - `curl`, `jq`, GNU `date`, and standard core utilities;
 - `qq-profile` on `PATH`, or an exact executable supplied through
-  `QQ_PROFILE_BIN`;
+  `QQ_PROFILE_BIN`, for interactive and `--once` profile rendering (not
+  headless production);
 - Pi's local authorization and session stores for provider usage collection;
 - Python 3 and Firefox only when refreshing the Qwen browser-cookie snapshot.
 
-Provider credentials are read only by terminal provider requests and are never
-displayed. Installation and upgrades do not touch the existing non-secret
+Provider credentials are read only by the shell producer's provider requests and
+are never displayed, passed as process arguments, or exposed to the Node
+service. Installation and upgrades do not touch the existing non-secret
 cache or Qwen cookie snapshot under `~/.local/state/qq/telemetry/`.
 
 ## Validate
@@ -254,8 +288,10 @@ npm run check
 Tests use private temporary homes and installation roots. They cover live
 project grouping, aliases and UUID-safe fallbacks, activity mapping, topology
 and ordering, workflow phase pass-through, provider cache isolation, malformed
-optional dependencies, snapshot read purity, plugin provision/disposal, the
-existing terminal dashboard, and atomic installation/restoration. They never
+optional dependencies, snapshot read purity, plugin provision/disposal, forced
+usage-read serialization, supervisor signal/restart/disposal behavior, headless
+producer isolation, the existing terminal dashboard, and atomic
+installation/restoration. They never
 access the operator's installed dashboard or telemetry state.
 
 Extracted from `hypermemetic-ai/qq` at commit

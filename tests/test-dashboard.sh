@@ -229,4 +229,94 @@ jq -e '
 ' "$usage_cache" >/dev/null
 ! grep -Eq 'codex-access|codex-account|grok-access' "$usage_cache"
 
+
+# Headless mode is the plugin-owned, cache-only producer. It must run repeated
+# cycles without loading profiles or writing/rendering a terminal frame, and
+# its piped stdout protocol is one exact non-secret signal per successful write.
+headless_home="$TMP/headless-home"
+headless_tmp="$TMP/headless-tmp"
+mkdir -m 700 "$headless_home" "$headless_tmp"
+cat >"$TMP/fake-bin/profile-spy" <<'SH'
+#!/usr/bin/env bash
+printf 'profile invoked: %s\n' "$*" >>"$QQ_PROFILE_SPY_LOG"
+printf 'headless-profile-secret\n'
+SH
+chmod 700 "$TMP/fake-bin/profile-spy"
+headless_out="$TMP/headless.out"
+headless_err="$TMP/headless.err"
+HOME="$headless_home" TMPDIR="$headless_tmp" TELEMETRY_REFRESH=1 \
+  QQ_PROFILE_BIN="$TMP/fake-bin/profile-spy" QQ_PROFILE_SPY_LOG="$TMP/profile-spy.log" \
+  "$ROOT/bin/qq-dashboard" --headless >"$headless_out" 2>"$headless_err" &
+headless_pid=$!
+for _ in $(seq 1 80); do
+  [[ $(wc -l <"$headless_out") -ge 2 ]] && break
+  kill -0 "$headless_pid" 2>/dev/null || break
+  sleep 0.05
+done
+if kill -0 "$headless_pid" 2>/dev/null; then kill -TERM "$headless_pid"; fi
+set +e
+wait "$headless_pid"
+headless_status=$?
+set -e
+[[ "$headless_status" -eq 143 ]]
+[[ $(wc -l <"$headless_out") -ge 2 ]]
+if grep -vxF 'qq-dashboard:usage-cache-updated' "$headless_out" >/dev/null; then
+  echo 'headless producer emitted a non-protocol stdout line' >&2
+  exit 1
+fi
+[[ ! -s "$headless_err" ]]
+[[ ! -e "$TMP/profile-spy.log" ]]
+[[ ! -e "$headless_home/.local/state/qq/telemetry/last-frame.txt" ]]
+! grep -Eq 'headless-profile-secret|\x1b|QQ DASHBOARD|Execution profiles' "$headless_out"
+headless_cache="$headless_home/.local/state/qq/telemetry/usage-cache.json"
+[[ "$(stat -c %a "$headless_cache")" == 600 ]]
+jq -e '
+  .schema == "qq.dashboard-usage/v1" and
+  ([.providers[].id] == ["codex", "grok", "qwen"]) and
+  ([.providers[].state] | all(. == "unavailable")) and
+  ([.providers[].observedAt] | all(. == null)) and
+  ([.providers[].meters] | all(length == 0))
+' "$headless_cache" >/dev/null
+[[ -z $(find "$headless_tmp" -maxdepth 1 -name 'qq-dashboard.*' -print -quit) ]]
+
+# Instrument a faster cache-only loop to prove that a slow fetch always ends
+# before the next starts; timer pressure cannot overlap provider requests.
+overlap_home="$TMP/headless-overlap-home"
+mkdir -m 700 "$overlap_home"
+HOME="$overlap_home" HEADLESS_LOG="$TMP/headless-overlap.log" \
+  bash -c '
+    source "$1"
+    REFRESH_SECS=.01
+    fetch_all() {
+      if [ -e "$HEADLESS_LOG.lock" ]; then printf "overlap\n" >>"$HEADLESS_LOG"; fi
+      : >"$HEADLESS_LOG.lock"
+      printf "start\n" >>"$HEADLESS_LOG"
+      sleep .08
+      printf "end\n" >>"$HEADLESS_LOG"
+      rm -f -- "$HEADLESS_LOG.lock"
+    }
+    persist_usage_cache() { return 0; }
+    qq_dashboard_main --headless
+  ' _ "$ROOT/bin/qq-dashboard" >"$TMP/headless-overlap.out" 2>"$TMP/headless-overlap.err" &
+overlap_pid=$!
+for _ in $(seq 1 80); do
+  [[ $(wc -l <"$TMP/headless-overlap.out") -ge 3 ]] && break
+  kill -0 "$overlap_pid" 2>/dev/null || break
+  sleep .02
+done
+if kill -0 "$overlap_pid" 2>/dev/null; then kill -TERM "$overlap_pid"; fi
+set +e
+wait "$overlap_pid"
+overlap_status=$?
+set -e
+[[ "$overlap_status" -eq 143 ]]
+[[ $(wc -l <"$TMP/headless-overlap.out") -ge 3 ]]
+! grep -q '^overlap$' "$TMP/headless-overlap.log"
+awk '
+  NR % 2 == 1 && $0 != "start" { exit 1 }
+  NR % 2 == 0 && $0 != "end" { exit 1 }
+  END { if (NR < 6) exit 1 }
+' "$TMP/headless-overlap.log"
+[[ ! -e "$TMP/headless-overlap.log.lock" ]]
+
 echo 'test-dashboard: pass'

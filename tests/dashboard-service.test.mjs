@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { apply, inject, name, provide } from "../src/plugin.mjs";
@@ -725,4 +728,122 @@ test("usage source reads on its own cadence and retains the last valid cache", a
   await cache.tick();
   assert.equal(cache.service.snapshot().usage.providers[0].meters[0].usedRatio, 0.4,
     "missing cache retains the last valid usage snapshot");
+});
+
+test("forced usage reads bypass cadence and coalesce without overlapping", async () => {
+  let now = 5_000;
+  let ratio = 0.1;
+  let usageCalls = 0;
+  let activeUsage = 0;
+  let maximumActiveUsage = 0;
+  const resolvers = [];
+  const usageFor = () => {
+    usageCalls += 1;
+    activeUsage += 1;
+    maximumActiveUsage = Math.max(maximumActiveUsage, activeUsage);
+    const currentRatio = ratio;
+    return new Promise((resolve) => resolvers.push(() => {
+      activeUsage -= 1;
+      resolve({
+        generatedAt: now,
+        providers: [{
+          id: "codex", label: "Codex", state: "ready", observedAt: now,
+          meters: [{ id: "weekly", label: "7d", usedRatio: currentRatio,
+            resetAt: null, detail: "" }],
+        }],
+      });
+    }));
+  };
+  const cache = createDashboardCache({
+    core: { listAgents() { return []; }, async list() { return []; } },
+    usageFor,
+    usageRefreshMs: 30_000,
+    now: () => now,
+  });
+  await waitFor(() => usageCalls === 1, "initial usage read did not start");
+  ratio = 0.9;
+  const forcedA = cache.forceUsageRead();
+  const forcedB = cache.forceUsageRead();
+  assert.strictEqual(forcedA, forcedB);
+  assert.equal(usageCalls, 1, "forced reads do not overlap an active read");
+
+  resolvers.shift()();
+  await waitFor(() => usageCalls === 2, "coalesced forced read did not start");
+  assert.equal(resolvers.length, 1);
+  resolvers.shift()();
+  await forcedA;
+  assert.equal(maximumActiveUsage, 1);
+  assert.equal(usageCalls, 2, "multiple signals become one forced follow-up");
+  assert.equal(cache.service.snapshot().usage.providers[0].meters[0].usedRatio, 0.9);
+
+  await cache.tick();
+  assert.equal(usageCalls, 2, "ordinary ticks remain cadence-limited after a force");
+});
+
+
+test("plugin-owned producer forces a prompt strict read and obeys all disable conditions", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qq-dashboard-plugin-producer."));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const usageFile = join(root, "usage-cache.json");
+  const services = new Map();
+  const effects = [];
+  const core = { listAgents() { return []; }, async list() { return []; } };
+  const ctx = {
+    get(service) { return service === "qq-core" ? core : null; },
+    provide(service, value) { services.set(service, value); },
+    effect(factory) { effects.push(factory()); },
+  };
+  let starts = 0;
+  let stops = 0;
+  let update = null;
+  const usageProducerFor = ({ onUpdate }) => {
+    starts += 1;
+    update = onUpdate;
+    return { dispose() { stops += 1; } };
+  };
+  const dispose = apply(ctx, {
+    refreshMs: 60_000,
+    usageRefreshMs: 60_000,
+    usageFile,
+    usageProducerFor,
+  });
+  await waitFor(() => services.get("qq-dashboard")?.snapshot().generatedAt >= 0,
+    "plugin service was not provided");
+  assert.equal(starts, 1);
+  assert.deepEqual(services.get("qq-dashboard").snapshot().usage.providers, []);
+
+  await writeFile(usageFile, JSON.stringify({
+    schema: "qq.dashboard-usage/v1",
+    generatedAt: 12_000,
+    providers: [
+      { id: "codex", label: "Codex", state: "ready", observedAt: 11_000,
+        meters: [{ id: "weekly", label: "7d", usedRatio: 0.6, resetAt: null, detail: "" }] },
+      { id: "grok", label: "Grok", state: "unavailable", observedAt: null, meters: [] },
+      { id: "qwen", label: "Qwen", state: "unavailable", observedAt: null, meters: [] },
+    ],
+  }), { mode: 0o600 });
+  update();
+  await waitFor(
+    () => services.get("qq-dashboard").snapshot().usage.providers[0]?.meters[0]?.usedRatio === 0.6,
+    "producer signal did not force the strict reader before cadence",
+  );
+  dispose();
+  effects[0]?.();
+  assert.equal(stops, 1, "returned and Cordis-effect disposal are idempotent");
+
+  for (const disabled of [
+    { usage: { generatedAt: 0, providers: [] } },
+    { usageFor: async () => ({ generatedAt: 0, providers: [] }) },
+    { produceUsage: false },
+  ]) {
+    const stopDisabled = apply(ctx, {
+      refreshMs: 60_000,
+      usageFile,
+      usageProducerFor,
+      ...disabled,
+    });
+    stopDisabled();
+  }
+  assert.equal(starts, 1,
+    "static usage, explicit usageFor, and produceUsage=false all suppress production");
 });
