@@ -41,14 +41,24 @@ is unavailable. States have exact display-cache meanings:
 
 - `ready`: a fresh provider reading;
 - `estimated`: a calibrated Qwen estimate derived from the local token meter;
-- `stale`: the last Qwen provider reading, still inside its quota window; and
-- `unavailable`: no usable reading for this cycle (`observedAt: null`, no
-  meters).
+- `stale`: a last-known-good reading with its original `observedAt`; and
+- `unavailable`: no usable current or eligible last-good reading
+  (`observedAt: null`, no meters).
+
+For Codex and Grok, last-known-good data is eligible for at most 15 minutes and
+never beyond a known quota reset. A request, authentication, or response-format
+failure changes an eligible row to `stale`, not `ready`; expiry changes only that
+row to `unavailable`. A fresh sibling provider still becomes `ready` in the same
+cache cycle. The reader also expires Codex/Grok stale rows independently, so a
+stopped producer cannot make one stale row persist indefinitely or hide a fresh
+row from another provider. Qwen retains its existing calibrated/window-bound
+estimate and stale policy.
 
 All timestamps are epoch milliseconds or `null`. Stable meter identities are
 `weekly` / `7d` and, for Qwen when known, `five-hour` / `5h`. `usedRatio` is a
-nonnegative number and may exceed one. `detail` contains only neutral display
-text such as a Qwen used/limit value and an `estimated` marker.
+nonnegative number; Codex/Grok percentages are bounded to one while Qwen may
+exceed one. `detail` contains only neutral display text such as a Qwen
+used/limit value and an `estimated` marker.
 
 The plugin reads the file once during its initial owner refresh and then at most
 once per its independent 30-second usage cadence, plus a prompt read after an
@@ -80,19 +90,50 @@ no signal and preserves the prior cache.
 
 ## Provider prerequisites
 
-- **Codex:** the shell producer reads the existing OpenAI Codex authorization
-  entry from Pi's local auth store.
-- **Grok:** the producer reads qq-models' OAuth store at the fixed HOME-relative
-  location `~/.local/state/qq/.qq-grok-auth.json`. It does not refresh or mutate
-  this file; qq-models owns refresh. Legacy Pi xai entries are accepted only
-  when the dedicated store is absent. An unsafe or invalid dedicated store
-  fails closed.
-- **Qwen:** gateway readings require explicit `TELEMETRY_QWEN_*` overrides or
-  the gated `~/.local/state/qq/telemetry/qwen.cookies` snapshot. Initialize the
-  snapshot with `qq-dashboard-cookies refresh`; the helper inventories only
-  qwencloud.com cookies and requires explicit confirmation before writing.
-  Neither the dashboard nor its producer reads Firefox or bypasses that gate.
-  Use `qq-dashboard-cookies status` and `validate` to inspect readiness.
+Codex and Grok first use the qq-models-owned OAuth files
+`.qq-codex-auth.json` and `.qq-grok-auth.json`. Their containing directory is
+resolved exactly as qq-models resolves DSH home:
+
+1. `QQ_DSH_HOME`;
+2. `DSH_HOME`;
+3. `$XDG_STATE_HOME/qq`;
+4. `$HOME/.local/state/qq`.
+
+Environment values and credential paths must be absolute and canonical. Every
+path component must be a real directory (not a symlink), and a credential must
+be a current-user, regular, readable, mode-`0600`, bounded file. Dedicated
+content must match `qq.models-auth/v1`, OAuth type, connector identity,
+nonempty token fields, and an unexpired millisecond expiry. Codex accepts
+qq-models' explicit `accountId` representation or the equivalent account claim
+from its access JWT. A present unsafe, expired, wrong-connector, or malformed
+selected dedicated store fails closed; it never searches a lower-precedence
+store or silently switches to Pi.
+
+When the selected dedicated file is genuinely absent, a similarly validated,
+read-only Pi credential may be used as a compatibility fallback (Codex, or
+legacy xai for Grok). This is not a refresh path. The dashboard never writes,
+rotates, locks, or refreshes qq-models or Pi OAuth state. qq-models remains the
+owner. Check recovery with `qq-models-login status`, then run
+`qq-models-login codex` or `qq-models-login grok` (or use the corresponding
+qq-models `/login`) when login/refresh is required.
+
+Provider requests run concurrently and independently. Each uses a six-second
+attempt timeout and at most one delayed retry for network failures, 408, 425,
+429, and selected 5xx responses. Permanent client/authentication responses,
+including 401 and 403, are not retried. A provider response is accepted only
+after a successful 2xx status and strict JSON normalization. Known current
+snake/camel field forms accept finite percentages as JSON numbers or strict
+numeric strings in the range 0..100. Reset times may be unambiguous modern epoch
+seconds, epoch milliseconds, or timezone-qualified RFC 3339 strings. Negative,
+non-finite, fractional/ambiguous timestamps, conflicting variants, malformed
+JSON, and junk field values are rejected.
+
+Qwen gateway readings require explicit `TELEMETRY_QWEN_*` overrides or the
+gated `~/.local/state/qq/telemetry/qwen.cookies` snapshot. Initialize the
+snapshot with `qq-dashboard-cookies refresh`; the helper inventories only
+qwencloud.com cookies and requires explicit confirmation before writing.
+Neither the dashboard nor its producer reads Firefox or bypasses that gate. Use
+`qq-dashboard-cookies status` and `validate` to inspect readiness.
 
 A Firefox profile or `cookies.sqlite` alone is not Qwen initialization. Until a
 snapshot or explicit override exists, Qwen correctly appears unavailable (or
@@ -101,8 +142,10 @@ uses an eligible persisted estimate/stale reading if one already exists).
 ## Security boundary
 
 The shell producer alone reads credentials, cookies, and raw provider responses.
-Grok's bearer is supplied through a mode-`0600` private temporary header file,
-not a process argument. Raw responses remain in private temporary files; only
-normalized display fields enter the mode-`0600` cache. Credentials, cookie
-values, raw payloads, and local credential paths never enter Node, child stdout,
-the cache, or qq-ui.
+Codex and Grok authorization/account headers are supplied through mode-`0600`
+private temporary header files, never process arguments. Bodies remain in the
+private temporary directory, are cleared before each cycle, and only normalized
+display fields enter the mode-`0600` cache. Credentials, refresh tokens, raw
+payloads, HTTP diagnostics, execution profiles, and local paths never enter
+Node, child stdout, the cache, or qq-ui. Headless stdout remains exactly the
+fixed cache-update signal.

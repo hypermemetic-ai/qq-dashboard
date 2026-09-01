@@ -95,20 +95,8 @@ renewed_summary=$(HOME="$TMP/home" bash -c 'source "$1"; GATEWAY_SPEC=pro; GATEW
 [[ "$renewed_summary" == *'gateway round-trip: ok'* ]]
 [[ "$renewed_summary" == *'weekly reset: window not started'* ]]
 
-mkdir -p "$TMP/home/.pi/agent" "$TMP/fake-bin"
-cat >"$TMP/home/.pi/agent/auth.json" <<'JSON'
-{"xai":{"type":"oauth","access":"stale","refresh":"refresh","expires":1}}
-JSON
-cat >"$TMP/fake-bin/pi" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$PI_LOG"
-SH
-chmod 700 "$TMP/fake-bin/pi"
-PI_LOG="$TMP/pi.log" PATH="$TMP/fake-bin:$PATH" HOME="$TMP/home" \
-  bash -c 'source "$1"; refresh_xai_auth' _ "$ROOT/bin/qq-dashboard"
-[[ "$(cat "$TMP/pi.log")" == 'auth check --provider xai' ]]
 
-# The dedicated qq-models credential reader accepts only the fixed, safe store.
+# The dedicated qq-models credential reader accepts only the selected safe store.
 # Status 1 is an absent store (eligible for the legacy fallback); every unsafe
 # or malformed store is status 2 and emits no credential diagnostic.
 store_probe_err="$TMP/store-probe.err"
@@ -117,7 +105,7 @@ probe_grok_store() {
   actual=$(HOME="$home" bash -c '
     source "$1"
     token=""
-    if token=$(grok_access_from_store); then status=0; else status=$?; fi
+    if models_auth_from_store grok; then status=0; token=$AUTH_ACCESS; else status=$?; fi
     printf "%s|%s" "$status" "$token"
   ' _ "$ROOT/bin/qq-dashboard" 2>>"$store_probe_err")
   if [[ "$actual" != "$expected" ]]; then
@@ -128,7 +116,7 @@ probe_grok_store() {
 store_home="$TMP/store-home"
 store_path="$store_home/.local/state/qq/.qq-grok-auth.json"
 mkdir -p "$store_home/.local/state/qq"
-printf '%s\n' '{"access":"store-fixture-token","refresh":"private","expires":999}' >"$store_path"
+printf '%s\n' '{"schema":"qq.models-auth/v1","type":"oauth","connector":"grok","access":"store-fixture-token","refresh":"private","expires":4102444800000}' >"$store_path"
 chmod 600 "$store_path"
 probe_grok_store "$store_home" '0|store-fixture-token'
 rm "$store_path"
@@ -186,19 +174,29 @@ chmod 700 "$TMP/fake-bin/profile-fail" "$TMP/fake-bin/profile-malformed"
 mkdir -p "$TMP/provider-home/.pi/agent"
 cat >"$TMP/provider-home/.pi/agent/auth.json" <<'JSON'
 {
-  "openai-codex": {"access":"codex-access","accountId":"codex-account"},
-  "xai-auth": {"access":"grok-access"}
+  "openai-codex": {"access":"codex-access","refresh":"codex-refresh","expires":4102444800000,"accountId":"codex-account"},
+  "xai-auth": {"access":"grok-access","refresh":"grok-refresh","expires":4102444800000}
 }
 JSON
+chmod 600 "$TMP/provider-home/.pi/agent/auth.json"
+cat >"$TMP/provider-codex.json" <<'JSON'
+{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000}}}
+JSON
+cat >"$TMP/provider-grok.json" <<'JSON'
+{"config":{"creditUsagePercent":30,"currentPeriod":{"end":"2033-05-18T03:33:20Z"}}}
+JSON
 provider_frame=$(HOME="$TMP/provider-home" QQ_PROFILE_BIN="$TMP/fake-bin/profile-fail" \
+  PROVIDER_CODEX_FIXTURE="$TMP/provider-codex.json" PROVIDER_GROK_FIXTURE="$TMP/provider-grok.json" \
   bash -c '
     source "$1"
-    api_get() {
-      if [[ "$1" == *chatgpt* ]]; then
-        printf "%s\n" '\''{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000}}}'\''
+    provider_api_get() {
+      output=$1; url=$2
+      if [[ "$url" == *chatgpt* ]]; then
+        cp -- "$PROVIDER_CODEX_FIXTURE" "$output"
       else
-        printf "%s\n" '\''{"config":{"creditUsagePercent":30,"currentPeriod":{"end":"2033-05-18T03:33:20Z"}}}'\''
+        cp -- "$PROVIDER_GROK_FIXTURE" "$output"
       fi
+      chmod 600 "$output"
     }
     qwen_update() {
       QWEN_L1="7d       live"; QWEN_L2=""
@@ -240,12 +238,13 @@ grok_auth="$grok_home/.local/state/qq/.qq-grok-auth.json"
 mkdir -p "$grok_home/.pi/agent" "$(dirname -- "$grok_auth")"
 cat >"$grok_home/.pi/agent/auth.json" <<'JSON'
 {
-  "openai-codex": {"access":"codex-e2e-access","accountId":"codex-e2e-account"},
-  "xai-auth": {"access":"legacy-must-not-bypass"}
+  "openai-codex": {"access":"codex-e2e-access","refresh":"codex-e2e-refresh","expires":4102444800000,"accountId":"codex-e2e-account"},
+  "xai-auth": {"access":"legacy-must-not-bypass","refresh":"legacy-refresh","expires":4102444800000}
 }
 JSON
+chmod 600 "$grok_home/.pi/agent/auth.json"
 cat >"$grok_auth" <<'JSON'
-{"access":"dedicated-e2e-token","refresh":"private-refresh","expires":1999999999999}
+{"schema":"qq.models-auth/v1","type":"oauth","connector":"grok","access":"dedicated-e2e-token","refresh":"private-refresh","expires":4102444800000}
 JSON
 chmod 600 "$grok_auth"
 cp "$grok_auth" "$TMP/grok-auth-before"
@@ -254,35 +253,49 @@ cat >"$TMP/fake-bin/curl" <<'SH'
 set -euo pipefail
 url=''
 auth_file=''
+output=''
 user_agent=0
 identifier=0
 version=0
 mode=0
-for argument in "$@"; do
+while [[ $# -gt 0 ]]; do
+  argument=$1; shift
   [[ "$argument" != *dedicated-e2e-token* ]]
   [[ "$argument" != *legacy-must-not-bypass* ]]
+  [[ "$argument" != *codex-e2e-access* ]]
   case "$argument" in
+    -o) output=$1; shift ;;
+    -w) [[ $1 == '%{http_code}' ]]; shift ;;
+    -H)
+      header=$1; shift
+      case "$header" in
+        @*) auth_file=${header#@} ;;
+        'User-Agent: @hypermemetic-ai/qq-models/0.0.0 (+https://github.com/hypermemetic-ai/qq)') user_agent=1 ;;
+        'x-grok-client-identifier: @hypermemetic-ai/qq-models') identifier=1 ;;
+        'x-grok-client-version: 1.0.3') version=1 ;;
+        'x-grok-client-mode: headless') mode=1 ;;
+      esac
+      ;;
     https://*) url=$argument ;;
-    @*) auth_file=${argument#@} ;;
-    'User-Agent: @hypermemetic-ai/qq-models/0.0.0 (+https://github.com/hypermemetic-ai/qq)') user_agent=1 ;;
-    'x-grok-client-identifier: @hypermemetic-ai/qq-models') identifier=1 ;;
-    'x-grok-client-version: 1.0.3') version=1 ;;
-    'x-grok-client-mode: headless') mode=1 ;;
+    --connect-timeout|-m) shift ;;
   esac
 done
+[[ -n $output && -n $auth_file && -f $auth_file && ! -L $auth_file && $(stat -c %a "$auth_file") = 600 ]]
 case "$url" in
   *chatgpt*)
-    printf '%s\n' '{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000}}}'
+    grep -Fxq 'Authorization: Bearer codex-e2e-access' "$auth_file"
+    grep -Fxq 'ChatGPT-Account-Id: codex-e2e-account' "$auth_file"
+    printf '%s\n' '{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000}}}' >"$output"
     ;;
   *cli-chat-proxy.grok.com*)
     [[ $user_agent = 1 && $identifier = 1 && $version = 1 && $mode = 1 ]]
-    [[ -f "$auth_file" && ! -L "$auth_file" && $(stat -c %a "$auth_file") = 600 ]]
     grep -Fxq 'Authorization: Bearer dedicated-e2e-token' "$auth_file"
     printf 'grok-request-ok\n' >>"$GROK_PROBE_LOG"
-    printf '%s\n' '{"config":{"creditUsagePercent":37,"currentPeriod":{"end":"2033-05-18T03:33:20Z"}},"privateRaw":"raw-billing-marker"}'
+    printf '%s\n' '{"config":{"creditUsagePercent":37,"currentPeriod":{"end":"2033-05-18T03:33:20Z"}},"privateRaw":"raw-billing-marker"}' >"$output"
     ;;
   *) exit 44 ;;
 esac
+printf '200'
 SH
 chmod 700 "$TMP/fake-bin/curl"
 grok_out="$TMP/grok-once.out"
@@ -306,7 +319,7 @@ jq -e '
   .providers[2].state == "unavailable"
 ' "$grok_cache" >/dev/null
 [[ "$(stat -c %a "$grok_cache")" == 600 ]]
-if grep -REq 'dedicated-e2e-token|private-refresh|raw-billing-marker|\.qq-grok-auth\.json' \
+if grep -REq 'dedicated-e2e-token|private-refresh|codex-e2e-access|codex-e2e-account|raw-billing-marker|\.qq-(grok|codex)-auth\.json' \
     "$grok_out" "$grok_err" "$grok_cache" "$TMP/grok-request.log"; then
   echo 'Grok producer leaked credential, payload, or credential path' >&2
   exit 1
@@ -321,9 +334,9 @@ PATH="$TMP/fake-bin:$PATH" GROK_PROBE_LOG="$TMP/grok-request.log" HOME="$grok_ho
 [[ "$(wc -l <"$TMP/grok-request.log")" == 1 ]]
 jq -e '
   .providers[0].state == "ready" and
-  .providers[1].state == "unavailable" and
-  .providers[1].observedAt == null and
-  (.providers[1].meters | length) == 0 and
+  .providers[1].state == "stale" and
+  (.providers[1].observedAt | type) == "number" and
+  .providers[1].meters[0].usedRatio == 0.37 and
   .providers[2].state == "unavailable"
 ' "$grok_cache" >/dev/null
 if grep -REq 'legacy-must-not-bypass|\.qq-grok-auth\.json' \
@@ -368,6 +381,7 @@ preserved=$(HOME="$TMP/home" bash -c '
 ' _ "$ROOT/bin/qq-dashboard")
 [[ "$preserved" == prior ]]
 
+rm -f -- "$usage_cache"
 malformed_frame=$(HOME="$TMP/provider-home" QQ_PROFILE_BIN="$TMP/fake-bin/profile-malformed" \
   "$ROOT/bin/qq-dashboard" --once 2>"$TMP/profile-malformed.err")
 malformed_plain=$(printf '%s' "$malformed_frame" | sed 's/\x1b\[[0-9;]*m//g')
@@ -451,6 +465,8 @@ HOME="$overlap_home" HEADLESS_LOG="$TMP/headless-overlap.log" \
       rm -f -- "$HEADLESS_LOG.lock"
     }
     persist_usage_cache() { return 0; }
+    overlap_term() { rm -f -- "$HEADLESS_LOG.lock"; exit_on_signal 143; }
+    trap overlap_term TERM
     qq_dashboard_main --headless
   ' _ "$ROOT/bin/qq-dashboard" >"$TMP/headless-overlap.out" 2>"$TMP/headless-overlap.err" &
 overlap_pid=$!
