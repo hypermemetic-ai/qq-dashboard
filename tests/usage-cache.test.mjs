@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   defaultUsageCachePath,
   MAX_USAGE_CACHE_BYTES,
+  PROVIDER_STALE_MAX_MS,
   readUsageCache,
   USAGE_CACHE_SCHEMA,
 } from "../src/usage-cache.mjs";
@@ -89,4 +90,69 @@ test("default cache path requires an absolute HOME", () => {
     "/operator/.local/state/qq/telemetry/usage-cache.json");
   assert.equal(defaultUsageCachePath({ HOME: "relative" }), null);
   assert.equal(defaultUsageCachePath({}), null);
+});
+
+
+test("Codex/Grok stale rows expire independently by age or reset", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qq-dashboard-usage-stale."));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = join(root, "usage-cache.json");
+  const generatedAt = 1_788_000_000_000;
+  const candidate = envelope();
+  candidate.generatedAt = generatedAt;
+  candidate.providers[0] = {
+    id: "codex", label: "Codex", state: "stale", observedAt: generatedAt - 60_000,
+    meters: [{ id: "weekly", label: "7d", usedRatio: 0.25,
+      resetAt: generatedAt + 120_000, detail: "" }],
+  };
+  candidate.providers[2] = {
+    id: "grok", label: "Grok", state: "ready", observedAt: generatedAt,
+    meters: [{ id: "weekly", label: "7d", usedRatio: 0.4,
+      resetAt: generatedAt + 3_600_000, detail: "" }],
+  };
+  await writeFile(file, JSON.stringify(candidate), { mode: 0o600 });
+
+  const eligible = await readUsageCache(file, generatedAt + 90_000);
+  assert.equal(eligible.providers.find(({ id }) => id === "codex").state, "stale");
+  assert.equal(eligible.providers.find(({ id }) => id === "grok").state, "ready");
+
+  const resetExpired = await readUsageCache(file, generatedAt + 120_000);
+  assert.deepEqual(resetExpired.providers.find(({ id }) => id === "codex"), {
+    id: "codex", label: "Codex", state: "unavailable", observedAt: null, meters: [],
+  });
+  assert.equal(resetExpired.providers.find(({ id }) => id === "grok").state, "ready",
+    "one expired stale row cannot mask a fresh sibling");
+
+  candidate.providers[0].meters[0].resetAt = null;
+  await writeFile(file, JSON.stringify(candidate), { mode: 0o600 });
+  const ageExpired = await readUsageCache(file,
+    candidate.providers[0].observedAt + PROVIDER_STALE_MAX_MS);
+  assert.equal(ageExpired.providers.find(({ id }) => id === "codex").state, "unavailable");
+});
+
+test("strict cache rejects unbounded or malformed provider stale rows", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "qq-dashboard-usage-stale-invalid."));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = join(root, "usage-cache.json");
+  const generatedAt = 1_788_000_000_000;
+  const candidate = envelope();
+  candidate.generatedAt = generatedAt;
+  candidate.providers[0] = {
+    id: "codex", label: "Codex", state: "stale",
+    observedAt: generatedAt - PROVIDER_STALE_MAX_MS,
+    meters: [{ id: "weekly", label: "7d", usedRatio: 0.25, resetAt: null, detail: "" }],
+  };
+  await writeFile(file, JSON.stringify(candidate), { mode: 0o600 });
+  assert.equal(await readUsageCache(file, generatedAt), null, "producer-age bound is strict");
+  candidate.providers[0].observedAt = generatedAt - 1;
+  candidate.providers[0].meters[0].resetAt = generatedAt;
+  await writeFile(file, JSON.stringify(candidate), { mode: 0o600 });
+  assert.equal(await readUsageCache(file, generatedAt), null, "expired stale reset is rejected");
+  candidate.providers[0].state = "ready";
+  candidate.providers[0].observedAt = generatedAt;
+  candidate.providers[0].meters[0] = {
+    id: "weekly", label: "7d", usedRatio: 1.01, resetAt: null, detail: "",
+  };
+  await writeFile(file, JSON.stringify(candidate), { mode: 0o600 });
+  assert.equal(await readUsageCache(file, generatedAt), null, "provider percentage cannot exceed 100%");
 });

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "check": "node --check src/plugin.mjs && node --check src/service.mjs && node --check src/snapshot.mjs && node --check src/usage-cache.mjs && node --check src/usage-producer.mjs",
-    "test": "npm run check && node --test tests/*.test.mjs && tests/test-dashboard.sh && tests/test-install.sh"
+    "test": "npm run check && node --test tests/*.test.mjs && tests/test-dashboard.sh && tests/test-provider-usage.sh && tests/test-install.sh"
   },
   "description": "Cached, presentation-neutral QQ live operator snapshot and terminal provider dashboard.",
   "main": "src/plugin.mjs",

@@ -208,8 +208,8 @@ service. The terminal utilities need:
 - `qq-profile` on `PATH`, or an exact executable supplied through
   `QQ_PROFILE_BIN`, for interactive and `--once` profile rendering (not
   headless production);
-- Pi's local authorization/session stores for Codex and the Qwen token meter;
-- qq-models' local OAuth store for Grok;
+- qq-models' Codex/Grok OAuth stores (with validated Pi fallback only when the
+  selected dedicated file is absent) and Pi's Qwen token meter;
 - Python 3 and Firefox only when refreshing the Qwen browser-cookie snapshot.
 
 Provider credentials stay in the shell producer and never enter Node, the cache,
