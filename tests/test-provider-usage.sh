@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
+umask 077
+# Tests that replace HOME must not inherit qq-models store selection from
+# the operator environment. Precedence tests set private values explicitly.
+unset QQ_DSH_HOME DSH_HOME XDG_STATE_HOME
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/qq-provider-usage-test.XXXXXX")"
 cleanup_test() { rm -rf -- "$TEST_TMP"; }
@@ -17,22 +22,56 @@ HEADLESS=1
 store_file() {
   local root=$1 connector=$2 access=$3 account=${4:-}
   mkdir -p -- "$root"
-  jq -cn --arg connector "$connector" --arg access "$access" --arg account "$account" '
-    {schema:"qq.models-auth/v1", type:"oauth", connector:$connector,
-     access:$access, refresh:"synthetic-refresh", expires:4102444800000}
-    + if $account == "" then {} else {accountId:$account} end
-  ' >"$root/.qq-$connector-auth.json"
-  chmod 600 "$root/.qq-$connector-auth.json"
+  STORE_ROOT="$root" STORE_CONNECTOR="$connector" STORE_ACCESS="$access" \
+    STORE_ACCOUNT="$account" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["STORE_ROOT"])
+connector = os.environ["STORE_CONNECTOR"]
+access = os.environ["STORE_ACCESS"]
+account = os.environ["STORE_ACCOUNT"]
+row = {
+    "schema": "qq.models-auth/v1",
+    "type": "oauth",
+    "connector": connector,
+    "access": access,
+    "refresh": "refresh-" + access,
+    "expires": 4102444800000,
+}
+if account:
+    row["accountId"] = account
+path = root / f".qq-{connector}-auth.json"
+path.write_text(json.dumps(row))
+path.chmod(0o600)
+PY
 }
 
 pi_file() {
   mkdir -p -- "$(dirname -- "$AUTH_FILE")"
-  jq -cn '{
-    "openai-codex": {access:"pi-codex", refresh:"synthetic-refresh",
-      expires:4102444800000, accountId:"pi-account"},
-    "xai-auth": {access:"pi-grok", refresh:"synthetic-refresh", expires:4102444800000}
-  }' >"$AUTH_FILE"
-  chmod 600 "$AUTH_FILE"
+  PI_AUTH_FILE="$AUTH_FILE" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+row = {
+    "openai-codex": {
+        "access": "pi-codex",
+        "refresh": "synthetic-refresh",
+        "expires": 4102444800000,
+        "accountId": "pi-account",
+    },
+    "xai-auth": {
+        "access": "pi-grok",
+        "refresh": "synthetic-refresh",
+        "expires": 4102444800000,
+    },
+}
+path = Path(os.environ["PI_AUTH_FILE"])
+path.write_text(json.dumps(row))
+path.chmod(0o600)
+PY
 }
 
 status_of() {
