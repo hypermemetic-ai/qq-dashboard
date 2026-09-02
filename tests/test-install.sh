@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
+# Tests that replace HOME must not inherit qq-models store selection from
+# the operator environment. Precedence tests set private values explicitly.
+unset QQ_DSH_HOME DSH_HOME XDG_STATE_HOME
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/qq-dashboard-install-test.XXXXXX")

@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
+umask 077
+# Tests that replace HOME must not inherit qq-models store selection from
+# the operator environment. Precedence tests set private values explicitly.
+unset QQ_DSH_HOME DSH_HOME XDG_STATE_HOME
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/qq-dashboard-test.XXXXXX")"
 cleanup() { rm -rf -- "$TMP"; }
@@ -101,15 +106,20 @@ renewed_summary=$(HOME="$TMP/home" bash -c 'source "$1"; GATEWAY_SPEC=pro; GATEW
 # or malformed store is status 2 and emits no credential diagnostic.
 store_probe_err="$TMP/store-probe.err"
 probe_grok_store() {
-  local home=$1 expected=$2 actual
-  actual=$(HOME="$home" bash -c '
+  local home=$1 expected_status=$2
+  if ! HOME="$home" EXPECTED_STATUS="$expected_status" bash -c '
     source "$1"
-    token=""
-    if models_auth_from_store grok; then status=0; token=$AUTH_ACCESS; else status=$?; fi
-    printf "%s|%s" "$status" "$token"
-  ' _ "$ROOT/bin/qq-dashboard" 2>>"$store_probe_err")
-  if [[ "$actual" != "$expected" ]]; then
-    printf 'unexpected Grok store probe for %s: %q != %q\n' "$home" "$actual" "$expected" >&2
+    if models_auth_from_store grok; then actual_status=0; else actual_status=$?; fi
+    if [[ "$actual_status" != "$EXPECTED_STATUS" ]]; then
+      printf "%s\n" "unexpected Grok store status" >&2
+      exit 1
+    fi
+    if [[ "$actual_status" == 0 && -z "$AUTH_ACCESS" ]]; then
+      printf "%s\n" "successful Grok store probe returned no credential" >&2
+      exit 1
+    fi
+  ' _ "$ROOT/bin/qq-dashboard" 2>>"$store_probe_err"; then
+    printf '%s\n' 'Grok store probe failed' >&2
     return 1
   fi
 }
@@ -118,37 +128,37 @@ store_path="$store_home/.local/state/qq/.qq-grok-auth.json"
 mkdir -p "$store_home/.local/state/qq"
 printf '%s\n' '{"schema":"qq.models-auth/v1","type":"oauth","connector":"grok","access":"store-fixture-token","refresh":"private","expires":4102444800000}' >"$store_path"
 chmod 600 "$store_path"
-probe_grok_store "$store_home" '0|store-fixture-token'
+probe_grok_store "$store_home" 0
 rm "$store_path"
-probe_grok_store "$store_home" '1|'
+probe_grok_store "$store_home" 1
 printf '%s\n' '{malformed' >"$store_path"
-probe_grok_store "$store_home" '2|'
+probe_grok_store "$store_home" 2
 printf '%s\n' '{"access":42}' >"$store_path"
-probe_grok_store "$store_home" '2|'
+probe_grok_store "$store_home" 2
 printf '%s\n' '{"access":""}' >"$store_path"
-probe_grok_store "$store_home" '2|'
+probe_grok_store "$store_home" 2
 printf '%s\n' '{"access":"header injection\nvalue"}' >"$store_path"
-probe_grok_store "$store_home" '2|'
+probe_grok_store "$store_home" 2
 printf '%s\n' '{"access":"unreadable"}' >"$store_path"
 chmod 000 "$store_path"
-probe_grok_store "$store_home" '2|'
+probe_grok_store "$store_home" 2
 chmod 600 "$store_path"
 rm "$store_path"
 mkdir "$store_path"
-probe_grok_store "$store_home" '2|'
+probe_grok_store "$store_home" 2
 rmdir "$store_path"
 printf '%s\n' '{"access":"symlink-target"}' >"$TMP/store-target.json"
 ln -s "$TMP/store-target.json" "$store_path"
-probe_grok_store "$store_home" '2|'
+probe_grok_store "$store_home" 2
 unsafe_parent_home="$TMP/unsafe-parent-home"
 mkdir "$unsafe_parent_home" "$TMP/external-local"
 ln -s "$TMP/external-local" "$unsafe_parent_home/.local"
-probe_grok_store "$unsafe_parent_home" '2|'
+probe_grok_store "$unsafe_parent_home" 2
 unsafe_home_target="$TMP/unsafe-home-target"
 mkdir "$unsafe_home_target"
 ln -s "$unsafe_home_target" "$TMP/unsafe-home-link"
-probe_grok_store "$TMP/unsafe-home-link" '2|'
-probe_grok_store relative-home '2|'
+probe_grok_store "$TMP/unsafe-home-link" 2
+probe_grok_store relative-home 2
 [[ ! -s "$store_probe_err" ]]
 
 signal_tmp="$TMP/signal-cleanup"
