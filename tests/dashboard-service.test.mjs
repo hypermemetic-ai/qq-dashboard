@@ -366,6 +366,7 @@ test("usage is strict cached display data and provider failure cannot suppress l
         id: "grok",
         label: "Grok",
         state: "unavailable",
+        issue: "login-required",
         observedAt: 1200,
         credential: "must-not-cross-boundary",
         meters: [],
@@ -374,6 +375,7 @@ test("usage is strict cached display data and provider failure cannot suppress l
         id: "codex",
         label: "Codex",
         state: "ready",
+        issue: "must-not-cross-boundary",
         observedAt: 1210,
         meters: [{
           id: "five-hour",
@@ -396,6 +398,7 @@ test("usage is strict cached display data and provider failure cannot suppress l
     id: "codex",
     label: "Codex",
     state: "ready",
+    issue: null,
     observedAt: 1210,
     meters: [{
       id: "five-hour",
@@ -410,7 +413,9 @@ test("usage is strict cached display data and provider failure cannot suppress l
 
   const result = projection({ usage });
   assert.equal(result.projects[0].sessions.length, 4);
-  assert.equal(result.usage.providers.find((provider) => provider.id === "grok").state, "unavailable");
+  const failedGrok = result.usage.providers.find((provider) => provider.id === "grok");
+  assert.equal(failedGrok.state, "unavailable");
+  assert.equal(failedGrok.issue, "login-required");
 });
 
 test("async cache snapshot is pure, reads each core authority once, and cadence-caches workflows", async () => {

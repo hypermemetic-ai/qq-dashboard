@@ -50,17 +50,29 @@ store_file "$qq_home" grok qq-choice
 store_file "$dsh_home" grok dsh-choice
 store_file "$xdg_root/qq" grok xdg-choice
 store_file "$default_home" grok default-choice
+store_file "$qq_home" codex qq-codex-choice qq-codex-account
+store_file "$dsh_home" codex dsh-codex-choice dsh-codex-account
+store_file "$xdg_root/qq" codex xdg-codex-choice xdg-codex-account
+store_file "$default_home" codex default-codex-choice default-codex-account
 QQ_DSH_HOME="  $qq_home  " DSH_HOME="$dsh_home" XDG_STATE_HOME="$xdg_root" models_auth_from_store grok
 [[ "$AUTH_ACCESS" == qq-choice ]]
+QQ_DSH_HOME="  $qq_home  " DSH_HOME="$dsh_home" XDG_STATE_HOME="$xdg_root" models_auth_from_store codex
+[[ "$AUTH_ACCESS:$AUTH_ACCOUNT" == qq-codex-choice:qq-codex-account ]]
 unset QQ_DSH_HOME
 DSH_HOME="$dsh_home" XDG_STATE_HOME="$xdg_root" models_auth_from_store grok
 [[ "$AUTH_ACCESS" == dsh-choice ]]
+DSH_HOME="$dsh_home" XDG_STATE_HOME="$xdg_root" models_auth_from_store codex
+[[ "$AUTH_ACCESS:$AUTH_ACCOUNT" == dsh-codex-choice:dsh-codex-account ]]
 unset DSH_HOME
 XDG_STATE_HOME="$xdg_root" models_auth_from_store grok
 [[ "$AUTH_ACCESS" == xdg-choice ]]
+XDG_STATE_HOME="$xdg_root" models_auth_from_store codex
+[[ "$AUTH_ACCESS:$AUTH_ACCOUNT" == xdg-codex-choice:xdg-codex-account ]]
 unset XDG_STATE_HOME
 models_auth_from_store grok
 [[ "$AUTH_ACCESS" == default-choice ]]
+models_auth_from_store codex
+[[ "$AUTH_ACCESS:$AUTH_ACCOUNT" == default-codex-choice:default-codex-account ]]
 
 # A configured higher-priority path is authoritative. Unsafe, malformed, or
 # absent selected dedicated state never searches a lower-priority dedicated
@@ -162,6 +174,8 @@ reject_response() {
 [[ "$(normalize grok '{"config":{"creditUsagePercent":0}}')" == $'0\t' ]]
 # Identical duplicate variants are accepted; conflicting ones are ambiguous.
 [[ "$(normalize grok '{"config":{"creditUsagePercent":30,"credit_usage_percent":"30","billingPeriodEnd":"2000000000","billing_period_end":2000000000}}')" == $'30\t2000000000000' ]]
+[[ "$(normalize codex '{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000},"primaryWindow":{"usedPercent":"25","resetAt":"2033-05-18T03:33:20Z"}}}')" == $'25\t2000000000000' ]]
+reject_response codex '{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":2000000000},"primaryWindow":{"usedPercent":25,"resetAt":"2033-05-18T03:33:21Z"}}}'
 reject_response grok '{"config":{"creditUsagePercent":30,"credit_usage_percent":31}}'
 reject_response codex '{"rate_limit":{"primary_window":{"used_percent":-1,"reset_at":2000000000}}}'
 reject_response codex '{"rate_limit":{"primary_window":{"used_percent":101,"reset_at":2000000000}}}'
@@ -203,22 +217,29 @@ printf '%s' "$result"
 CURL
 chmod 700 "$fake_bin/curl"
 request_case() {
-  local plan=$1 expected_status=$2 expected_count=$3
+  local plan=$1 expected_status=$2 expected_count=$3 expected_result=$4 status result
   printf '%s\n' "$plan" | tr ' ' '\n' >"$TEST_TMP/request-plan"
-  rm -f -- "$TEST_TMP/request-count" "$TEST_TMP/request-output"
+  rm -f -- "$TEST_TMP/request-count" "$TEST_TMP/request-output" "$TEST_TMP/request-output.result"
   if PATH="$fake_bin:$PATH" REQUEST_PLAN="$TEST_TMP/request-plan" REQUEST_COUNT="$TEST_TMP/request-count" \
       provider_api_get "$TEST_TMP/request-output" https://provider.invalid; then
     status=0
   else
     status=$?
   fi
-  [[ "$status" == "$expected_status" && "$(cat "$TEST_TMP/request-count")" == "$expected_count" ]]
+  result=$(cat "$TEST_TMP/request-output.result")
+  [[ "$status" == "$expected_status" && "$(cat "$TEST_TMP/request-count")" == "$expected_count" \
+    && "$result" == "$expected_result" ]]
+  [[ "$(stat -c %a "$TEST_TMP/request-output.result")" == 600 ]]
 }
-request_case '503 200' 0 2
-request_case 'network 200' 0 2
-request_case '401 200' 1 1
-request_case '400 200' 1 1
-request_case '503 503 200' 1 2
+request_case '503 200' 0 2 success
+request_case 'network 200' 0 2 success
+request_case '401 200' 1 1 login-required
+request_case '403 200' 1 1 login-required
+request_case '400 200' 1 1 provider-error
+request_case '503 503 200' 1 2 temporary
+: >"$TEST_TMP/empty-success"
+printf '%s\n' success >"$TEST_TMP/empty-success.result"
+[[ "$(provider_request_result "$TEST_TMP/empty-success")" == response-error ]]
 
 # End-to-end cycle seam: one provider and Qwen can succeed while the other
 # fails; last-good rows retain original observation time and expire by age/reset.
@@ -242,7 +263,9 @@ provider_api_get() {
   local output=$1 url=$2
   case "$REQUEST_MODE:$url" in
     codex:*chatgpt*|both:*chatgpt*) cp "$TEST_TMP/cycle-codex.json" "$output" ;;
-    grok:*grok.com*|both:*grok.com*) cp "$TEST_TMP/cycle-grok.json" "$output" ;;
+    grok:*grok.com*|both:*grok.com*|auth-codex:*grok.com*|bad-codex:*grok.com*) cp "$TEST_TMP/cycle-grok.json" "$output" ;;
+    auth-codex:*chatgpt*) (umask 077; printf '%s\n' login-required >"$output.result"); return 1 ;;
+    bad-codex:*chatgpt*) printf '%s\n' '{"rate_limit":{"primary_window":{"used_percent":"unsupported"}}}' >"$output" ;;
     *) return 1 ;;
   esac
   chmod 600 "$output"
@@ -267,9 +290,54 @@ fetch_all
 [[ "$CODEX_USAGE_STATE:$GROK_USAGE_STATE:$QWEN_USAGE_STATE" == stale:ready:ready ]]
 [[ "$CODEX_USAGE_OBSERVED_AT" == "$first_observed" ]]
 persist_usage_cache
-FAKE_NOW=$((first_observed / 1000 + PROVIDER_STALE_MAX_SECS)); REQUEST_MODE=fail
+FAKE_NOW=$((first_observed / 1000 + CODEX_STALE_MAX_SECS)); REQUEST_MODE=fail
 fetch_all
 [[ "$CODEX_USAGE_STATE" == unavailable && "$GROK_USAGE_STATE" == stale && "$QWEN_USAGE_STATE" == ready ]]
+
+# Reproduce the operator-visible Codex disappearance: auth/config failures must
+# not be silently hidden behind prior data, while an independent Grok succeeds.
+cp "$TEST_TMP/codex-before" "$cycle_home/.qq-codex-auth.json"
+FAKE_NOW=1900000100; REQUEST_MODE=both
+fetch_all
+persist_usage_cache
+REQUEST_MODE=auth-codex
+FAKE_NOW=$((FAKE_NOW + 30))
+fetch_all
+[[ "$CODEX_USAGE_STATE:$CODEX_USAGE_ISSUE:$GROK_USAGE_STATE" == stale:login-required:ready ]]
+[[ "$GPT_WEEK" == *'run qq-models-login codex'* ]]
+persist_usage_cache
+jq -e '.providers[0].state == "stale" and .providers[0].issue == "login-required" and
+       .providers[0].meters[0].detail == "run qq-models-login codex" and
+       .providers[1].state == "ready" and .providers[1].issue == null' "$USAGE_CACHE" >/dev/null
+
+# Ordinary access-token expiry has the same visible recovery state. The
+# dashboard does not mutate/refresh the qq-models-owned file or downgrade to Pi.
+cp "$TEST_TMP/codex-before" "$cycle_home/.qq-codex-auth.json"
+jq --argjson expires "$((FAKE_NOW * 1000))" '.expires = $expires'   "$cycle_home/.qq-codex-auth.json" >"$TEST_TMP/expired-codex"
+mv "$TEST_TMP/expired-codex" "$cycle_home/.qq-codex-auth.json"
+chmod 600 "$cycle_home/.qq-codex-auth.json"
+cp "$cycle_home/.qq-codex-auth.json" "$TEST_TMP/expired-codex-before"
+REQUEST_MODE=grok; FAKE_NOW=$((FAKE_NOW + 30)); fetch_all
+[[ "$CODEX_USAGE_STATE:$CODEX_USAGE_ISSUE:$GROK_USAGE_STATE" == stale:login-required:ready ]]
+[[ "$GPT_WEEK" == *'run qq-models-login codex'* ]]
+cmp "$TEST_TMP/expired-codex-before" "$cycle_home/.qq-codex-auth.json"
+cp "$TEST_TMP/codex-before" "$cycle_home/.qq-codex-auth.json"
+
+# A malformed 2xx response is eligible for last-good, but truthfully classified.
+REQUEST_MODE=both; FAKE_NOW=$((FAKE_NOW + 30)); fetch_all; persist_usage_cache
+REQUEST_MODE=bad-codex; FAKE_NOW=$((FAKE_NOW + 30)); fetch_all
+[[ "$CODEX_USAGE_STATE:$CODEX_USAGE_ISSUE:$GROK_USAGE_STATE" == stale:response-error:ready ]]
+[[ "$GPT_WEEK" == *'stale'*'provider response unsupported'* ]]
+persist_usage_cache
+
+# Present invalid dedicated state is actionable configuration failure, never Pi
+# downgrade and never silently masked by the eligible prior Codex row.
+printf '%s\n' '{malformed' >"$cycle_home/.qq-codex-auth.json"
+chmod 600 "$cycle_home/.qq-codex-auth.json"
+REQUEST_MODE=grok; FAKE_NOW=$((FAKE_NOW + 30)); fetch_all
+[[ "$CODEX_USAGE_STATE:$CODEX_USAGE_ISSUE:$GROK_USAGE_STATE" == stale:configuration:ready ]]
+[[ "$GPT_WEEK" == *'check qq-models auth configuration'* ]]
+cp "$TEST_TMP/codex-before" "$cycle_home/.qq-codex-auth.json"
 
 # A reset bound expires last-good sooner than the age horizon.
 rm -f -- "$USAGE_CACHE"

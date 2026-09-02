@@ -24,6 +24,7 @@ The on-disk envelope is separate from the public dashboard schema:
     id: "codex",
     label: "Codex",
     state: "ready",
+    issue: null,
     observedAt: 1788000000000,
     meters: [{
       id: "weekly",
@@ -45,25 +46,46 @@ is unavailable. States have exact display-cache meanings:
 - `unavailable`: no usable current or eligible last-good reading
   (`observedAt: null`, no meters).
 
-For Codex and Grok, last-known-good data is eligible for at most 15 minutes and
-never beyond a known quota reset. A request, authentication, or response-format
-failure changes an eligible row to `stale`, not `ready`; expiry changes only that
-row to `unavailable`. A fresh sibling provider still becomes `ready` in the same
-cache cycle. The reader also expires Codex/Grok stale rows independently, so a
-stopped producer cannot make one stale row persist indefinitely or hide a fresh
-row from another provider. Qwen retains its existing calibrated/window-bound
-estimate and stale policy.
+For Codex and Grok, last-known-good data is eligible for at most six hours and
+never beyond a known quota reset. A temporary transport/provider failure or an
+unsupported successful response may retain an eligible row as `stale`; its
+original `observedAt` is never advanced. Missing, expired, malformed, or unsafe
+credentials and permanent authentication/client rejections may retain that safe
+display row too, but the fixed actionable `issue` is attached and rendered; no
+foreign credential is tried. Once ineligible, only that row becomes actionable
+`unavailable`, and a fresh sibling provider still becomes `ready` in the same
+cache cycle. The reader also expires Codex/Grok stale rows independently,
+so a stopped producer cannot make one stale row persist indefinitely or hide a
+fresh row from another provider. Qwen retains its existing calibrated/window-
+bound estimate and stale policy.
+
+Every new producer row also has nullable `issue`. It is `null` after a fresh
+success and for Qwen. Codex/Grok use only these fixed non-secret values:
+
+- `login-required`: credentials are missing/expired or the provider returned
+  401/403; run `qq-models-login <provider>` or the corresponding `/login`;
+- `configuration`: the selected auth home/file failed path, type, ownership,
+  mode, schema, connector, or account-id validation;
+- `provider-error`: a permanent non-auth request rejection;
+- `response-error`: a successful response did not match a safe supported shape;
+- `temporary`: a transport, timeout, rate-limit, or retryable provider failure.
+
+Old `qq.dashboard-usage/v1` rows without `issue` remain readable and normalize
+to `null`. For an eligible stale row, the same classification is converted to
+one exact safe action in meter `detail`, which existing qq-ui versions render.
+Fresh Codex/Grok detail remains empty. Arbitrary issue/detail strings are
+rejected, so provider text and diagnostics cannot use either as a cache channel.
 
 All timestamps are epoch milliseconds or `null`. Stable meter identities are
 `weekly` / `7d` and, for Qwen when known, `five-hour` / `5h`. `usedRatio` is a
 nonnegative number; Codex/Grok percentages are bounded to one while Qwen may
-exceed one. `detail` contains only neutral display text such as a Qwen
-used/limit value and an `estimated` marker.
+exceed one. `detail` contains only neutral display text: a Qwen used/limit value and
+`estimated` marker, or an exact fixed Codex/Grok stale recovery action.
 
 The plugin reads the file once during its initial owner refresh and then at most
 once per its independent 30-second usage cadence, plus a prompt read after an
 exact successful producer signal. It rejects symlinks, non-regular or oversized
-files, malformed JSON, wrong schemas, and invalid rows. Missing or rejected
+files, wrong owner/mode, malformed JSON, wrong schemas, and invalid rows. Missing or rejected
 input starts empty and later preserves the last valid cache; it never suppresses
 live project/session state. A static `config.usage` remains available for
 embedders and tests and suppresses the default file reader unless an explicit
@@ -119,12 +141,14 @@ qq-models `/login`) when login/refresh is required.
 
 Provider requests run concurrently and independently. Each uses a six-second
 attempt timeout and at most one delayed retry for network failures, 408, 425,
-429, and selected 5xx responses. Permanent client/authentication responses,
-including 401 and 403, are not retried. A provider response is accepted only
+429, and selected 5xx responses. Permanent client/authentication responses are not retried; 401/403 become
+`login-required`, while other permanent rejections become `provider-error`.
+A provider response is accepted only
 after a successful 2xx status and strict JSON normalization. Known current
 snake/camel field forms accept finite percentages as JSON numbers or strict
 numeric strings in the range 0..100. Reset times may be unambiguous modern epoch
-seconds, epoch milliseconds, or timezone-qualified RFC 3339 strings. Negative,
+seconds, epoch milliseconds, or timezone-qualified RFC 3339 strings. Multiple
+representations may coexist only when they resolve to the same instant. Negative,
 non-finite, fractional/ambiguous timestamps, conflicting variants, malformed
 JSON, and junk field values are rejected.
 

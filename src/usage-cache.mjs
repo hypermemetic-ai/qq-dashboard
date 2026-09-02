@@ -6,10 +6,37 @@ import { normalizeUsage } from "./snapshot.mjs";
 
 export const USAGE_CACHE_SCHEMA = "qq.dashboard-usage/v1";
 export const MAX_USAGE_CACHE_BYTES = 131_072;
-export const PROVIDER_STALE_MAX_MS = 15 * 60 * 1000;
+export const PROVIDER_STALE_MAX_MS = 6 * 60 * 60 * 1000;
+export const PROVIDER_STALE_MAX_MS_BY_ID = Object.freeze({
+  codex: PROVIDER_STALE_MAX_MS,
+  grok: PROVIDER_STALE_MAX_MS,
+});
 const STATES = new Set(["ready", "estimated", "stale", "unavailable"]);
 const PROVIDERS = new Set(["codex", "grok", "qwen"]);
 const PROVIDER_LABELS = new Map([["codex", "Codex"], ["grok", "Grok"], ["qwen", "Qwen"]]);
+const PROVIDER_ISSUES = new Set([
+  null, "login-required", "configuration", "provider-error", "response-error", "temporary",
+]);
+
+function providerIssue(provider) {
+  return provider.issue === undefined ? null : provider.issue;
+}
+
+function providerStaleMaxMs(id) {
+  return PROVIDER_STALE_MAX_MS_BY_ID[id] ?? 0;
+}
+
+function providerDetail(provider) {
+  if (provider.state !== "stale") return "";
+  switch (providerIssue(provider)) {
+    case "login-required": return `run qq-models-login ${provider.id}`;
+    case "configuration": return "check qq-models auth configuration";
+    case "provider-error": return "provider rejected usage request";
+    case "response-error": return "provider response unsupported";
+    case "temporary": return "temporary provider failure";
+    default: return "";
+  }
+}
 
 function epoch(value) {
   return Number.isSafeInteger(value) && value >= 0;
@@ -30,6 +57,10 @@ function validEnvelope(candidate) {
       || provider.label !== PROVIDER_LABELS.get(provider.id) || !STATES.has(provider.state)
       || (provider.id !== "qwen" && provider.state !== "ready"
         && provider.state !== "stale" && provider.state !== "unavailable")
+      || !PROVIDER_ISSUES.has(providerIssue(provider))
+      || (provider.id === "qwen" && providerIssue(provider) !== null)
+      || ((provider.state === "ready" || provider.state === "estimated")
+        && providerIssue(provider) !== null)
       || !(provider.observedAt === null || epoch(provider.observedAt))
       || (provider.observedAt !== null && provider.observedAt > candidate.generatedAt)
       || !Array.isArray(provider.meters)) return false;
@@ -54,14 +85,15 @@ function validEnvelope(candidate) {
           || (meter.id === "five-hour" && meter.label !== "5h")) return false;
         if (!/^\d+ \/ \d+( estimated)?$/.test(meter.detail)
           || (provider.state === "estimated") !== meter.detail.endsWith(" estimated")) return false;
-      } else if (meter.id !== "weekly" || meter.label !== "7d" || meter.detail !== "") {
+      } else if (meter.id !== "weekly" || meter.label !== "7d"
+        || meter.detail !== providerDetail(provider)) {
         return false;
       }
     }
     if (provider.state !== "unavailable"
       && (!meters.has("weekly") || (provider.id !== "qwen" && meters.size !== 1))) return false;
     if (provider.id !== "qwen" && provider.state === "stale") {
-      if (candidate.generatedAt - provider.observedAt >= PROVIDER_STALE_MAX_MS
+      if (candidate.generatedAt - provider.observedAt >= providerStaleMaxMs(provider.id)
         || provider.meters.some((meter) => meter.resetAt !== null
           && meter.resetAt <= candidate.generatedAt)) return false;
     }
@@ -81,11 +113,11 @@ function expireProviderStale(candidate, at) {
     providers: candidate.providers.map((provider) => {
       if (provider.id === "qwen" || provider.state !== "stale") return provider;
       const expiredByAge = current < provider.observedAt
-        || current - provider.observedAt >= PROVIDER_STALE_MAX_MS;
+        || current - provider.observedAt >= providerStaleMaxMs(provider.id);
       const expiredByReset = provider.meters.some((meter) => meter.resetAt !== null
         && current >= meter.resetAt);
       return expiredByAge || expiredByReset
-        ? { id: provider.id, label: provider.label, state: "unavailable", observedAt: null, meters: [] }
+        ? { ...provider, state: "unavailable", observedAt: null, meters: [] }
         : provider;
     }),
   };
@@ -99,7 +131,9 @@ export async function readUsageCache(filePath, now = Date.now) {
     const noFollow = constants.O_NOFOLLOW ?? 0;
     handle = await open(filePath, constants.O_RDONLY | noFollow);
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_USAGE_CACHE_BYTES) return null;
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+    if (!stat.isFile() || (stat.mode & 0o7777) !== 0o600 || stat.uid !== expectedUid
+      || stat.size <= 0 || stat.size > MAX_USAGE_CACHE_BYTES) return null;
     const raw = await handle.readFile({ encoding: "utf8" });
     const candidate = JSON.parse(raw);
     if (!validEnvelope(candidate)) return null;
