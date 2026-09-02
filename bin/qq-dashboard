@@ -11,7 +11,8 @@ source "$SCRIPT_DIR/lib/telemetry-lib.sh"
 TELEMETRY_HOME="${HOME:-}"
 AUTH_FILE="${TELEMETRY_HOME}/.pi/agent/auth.json"
 MODELS_AUTH_SCHEMA='qq.models-auth/v1'
-PROVIDER_STALE_MAX_SECS=900
+CODEX_STALE_MAX_SECS=21600
+GROK_STALE_MAX_SECS=21600
 PROVIDER_HTTP_MAX_ATTEMPTS=2
 PROVIDER_HTTP_RETRY_DELAY=.2
 PROVIDER_MAX_RESPONSE_BYTES=1048576
@@ -37,6 +38,7 @@ C_RED=$'\033[31m'
 
 TELEMETRY_TMP=""
 USAGE_CACHE_TMP=""
+AUTH_ISSUE=configuration
 cleanup() {
   if [ -n "$USAGE_CACHE_TMP" ]; then rm -f -- "$USAGE_CACHE_TMP"; fi
   if [ -n "$TELEMETRY_TMP" ] && [ -d "$TELEMETRY_TMP" ]; then
@@ -128,37 +130,54 @@ codex_account_from_token() {
 models_auth_from_store() {
   # Globals AUTH_ACCESS/AUTH_ACCOUNT are caller-only credential state. Status 1
   # is an absent selected dedicated store; status 2 is present/unsafe/invalid.
-  local connector=$1 file row nowms
-  AUTH_ACCESS=''; AUTH_ACCOUNT=''
+  # AUTH_ISSUE is a bounded non-secret classification, never provider text.
+  local connector=$1 file row nowms expires status
+  AUTH_ACCESS=''; AUTH_ACCOUNT=''; AUTH_ISSUE=configuration
   resolve_models_home || return 2
   file="${MODELS_HOME%/}/.qq-${connector}-auth.json"
-  safe_regular_file "$file" || return $?
-  nowms=$(( $(now_epoch) * 1000 ))
-  row=$(jq -er --arg schema "$MODELS_AUTH_SCHEMA" --arg connector "$connector" --argjson now "$nowms" '
+  if safe_regular_file "$file"; then :; else
+    status=$?
+    [ "$status" -eq 1 ] && AUTH_ISSUE=missing
+    return "$status"
+  fi
+  row=$(jq -ec --arg schema "$MODELS_AUTH_SCHEMA" --arg connector "$connector" '
     def token: type == "string" and test("^[^[:space:][:cntrl:]]{1,16384}$");
     def finite: (isinfinite or isnan) | not;
     if type == "object" and .schema == $schema and .type == "oauth"
        and .connector == $connector and (.access | token) and (.refresh | token)
-       and (.expires | type == "number" and finite and floor == . and . > $now and . <= 9007199254740991)
+       and (.expires | type == "number" and finite and floor == . and . >= 0 and . <= 9007199254740991)
        and ((has("accountId") | not) or (.accountId | token and length <= 1024))
-    then [.access, (.accountId // "")] | @tsv
+    then {access, account: (.accountId // ""), expires}
     else error("invalid auth") end
   ' "$file" 2>/dev/null) || return 2
-  IFS=$'\t' read -r AUTH_ACCESS AUTH_ACCOUNT <<<"$row"
+  expires=$(jq -r '.expires' <<<"$row" 2>/dev/null) || return 2
+  nowms=$(( $(now_epoch) * 1000 ))
+  if ! [[ "$expires" =~ ^[0-9]+$ ]] || [ "$expires" -le "$nowms" ]; then
+    AUTH_ISSUE=login-required
+    return 2
+  fi
+  AUTH_ACCESS=$(jq -r '.access' <<<"$row" 2>/dev/null) || return 2
+  AUTH_ACCOUNT=$(jq -r '.account' <<<"$row" 2>/dev/null) || { AUTH_ACCESS=''; return 2; }
   [ -n "$AUTH_ACCESS" ] || return 2
   if [ "$connector" = codex ] && [ -z "$AUTH_ACCOUNT" ]; then
-    AUTH_ACCOUNT=$(codex_account_from_token "$AUTH_ACCESS") || { AUTH_ACCESS=''; return 2; }
+    AUTH_ACCOUNT=$(codex_account_from_token "$AUTH_ACCESS") || {
+      AUTH_ACCESS=''; AUTH_ISSUE=configuration; return 2;
+    }
   fi
+  AUTH_ISSUE=''
 }
 
 pi_auth_from_store() {
   # Read-only legacy fallback. It is considered only when the selected
   # dedicated store is absent, and receives the same path/mode/content checks.
-  local connector=$1 row nowms
-  AUTH_ACCESS=''; AUTH_ACCOUNT=''
-  safe_regular_file "$AUTH_FILE" || return 2
-  nowms=$(( $(now_epoch) * 1000 ))
-  row=$(jq -er --arg connector "$connector" --argjson now "$nowms" '
+  local connector=$1 row nowms expires status
+  AUTH_ACCESS=''; AUTH_ACCOUNT=''; AUTH_ISSUE=configuration
+  if safe_regular_file "$AUTH_FILE"; then :; else
+    status=$?
+    [ "$status" -eq 1 ] && AUTH_ISSUE=login-required
+    return 2
+  fi
+  row=$(jq -ec --arg connector "$connector" '
     def token: type == "string" and test("^[^[:space:][:cntrl:]]{1,16384}$");
     def finite: (isinfinite or isnan) | not;
     (if $connector == "codex" then (."openai-codex" // .codex)
@@ -166,50 +185,73 @@ pi_auth_from_store() {
     | ($outer.oauth // $outer) as $auth
     | if ($outer | type) == "object" and ($auth | type) == "object"
          and ($auth.access | token) and ($auth.refresh | token)
-         and ($auth.expires | type == "number" and finite and floor == . and . > $now and . <= 9007199254740991)
+         and ($auth.expires | type == "number" and finite and floor == . and . >= 0 and . <= 9007199254740991)
          and (($auth | has("accountId") | not) or ($auth.accountId | token and length <= 1024))
-      then [$auth.access, ($auth.accountId // "")] | @tsv
+      then {access: $auth.access, account: ($auth.accountId // ""), expires: $auth.expires}
       else error("invalid auth") end
   ' "$AUTH_FILE" 2>/dev/null) || return 2
-  IFS=$'\t' read -r AUTH_ACCESS AUTH_ACCOUNT <<<"$row"
+  expires=$(jq -r '.expires' <<<"$row" 2>/dev/null) || return 2
+  nowms=$(( $(now_epoch) * 1000 ))
+  if ! [[ "$expires" =~ ^[0-9]+$ ]] || [ "$expires" -le "$nowms" ]; then
+    AUTH_ISSUE=login-required
+    return 2
+  fi
+  AUTH_ACCESS=$(jq -r '.access' <<<"$row" 2>/dev/null) || return 2
+  AUTH_ACCOUNT=$(jq -r '.account' <<<"$row" 2>/dev/null) || { AUTH_ACCESS=''; return 2; }
   [ -n "$AUTH_ACCESS" ] || return 2
   if [ "$connector" = codex ] && [ -z "$AUTH_ACCOUNT" ]; then
-    AUTH_ACCOUNT=$(codex_account_from_token "$AUTH_ACCESS") || { AUTH_ACCESS=''; return 2; }
+    AUTH_ACCOUNT=$(codex_account_from_token "$AUTH_ACCESS") || {
+      AUTH_ACCESS=''; AUTH_ISSUE=configuration; return 2;
+    }
   fi
+  AUTH_ISSUE=''
 }
 
 provider_credentials() {
   local connector=$1 status
+  AUTH_ISSUE=configuration
   if models_auth_from_store "$connector"; then return 0; else status=$?; fi
   [ "$status" -eq 1 ] || return 2
   pi_auth_from_store "$connector"
 }
 
 provider_api_get() {
-  # Body and status stay in the private temp directory. Bearers are supplied by
-  # caller-owned 0600 header files, never process arguments. No diagnostics are
-  # emitted. At most one bounded retry is made, and never for auth/client errors.
+  # Body and a fixed non-secret result classification stay in the private temp
+  # directory. Bearers are supplied by caller-owned 0600 header files, never
+  # process arguments. At most one bounded retry is made, never for auth/client
+  # errors. No status, diagnostics, or provider body crosses this boundary.
   local output=$1 url=$2; shift 2
-  local attempt=1 temporary="${output}.attempt" status rc retry
-  rm -f -- "$output" "$temporary"
+  local attempt=1 temporary="${output}.attempt" result="${output}.result"
+  local status rc retry failure
+  rm -f -- "$output" "$temporary" "$result"
   while [ "$attempt" -le "$PROVIDER_HTTP_MAX_ATTEMPTS" ]; do
-    status=''; rc=0
+    status=''; rc=0; failure=temporary
     status=$(curl -sS --connect-timeout 3 -m 6 --max-filesize "$PROVIDER_MAX_RESPONSE_BYTES" \
       -H 'Accept: application/json' -o "$temporary" -w '%{http_code}' "$@" "$url" 2>/dev/null) || rc=$?
     [[ "$status" =~ ^[0-9]{3}$ ]] || status=000
     if [ "$rc" -eq 0 ] && [[ "$status" =~ ^2[0-9][0-9]$ ]] &&
        [ -f "$temporary" ] && [ "$(stat -c %s -- "$temporary" 2>/dev/null || printf 0)" -le "$PROVIDER_MAX_RESPONSE_BYTES" ]; then
-      mv -f -- "$temporary" "$output" 2>/dev/null || { rm -f -- "$temporary"; return 1; }
-      chmod 600 "$output" 2>/dev/null || { rm -f -- "$output"; return 1; }
-      return 0
+      if mv -f -- "$temporary" "$output" 2>/dev/null && chmod 600 "$output" 2>/dev/null; then
+        (umask 077; printf '%s\n' success >"$result")
+        return 0
+      fi
+      rm -f -- "$output" "$temporary"
+      break
     fi
     rm -f -- "$temporary"
     retry=0
-    if [ "$rc" -ne 0 ] || [[ "$status" =~ ^(408|425|429|500|502|503|504)$ ]]; then retry=1; fi
+    if [ "$rc" -ne 0 ] || [[ "$status" =~ ^(408|425|429|500|502|503|504)$ ]]; then
+      retry=1; failure=temporary
+    elif [[ "$status" =~ ^(401|403)$ ]]; then
+      failure=login-required
+    else
+      failure="provider-error"
+    fi
     if [ "$retry" -ne 1 ] || [ "$attempt" -ge "$PROVIDER_HTTP_MAX_ATTEMPTS" ]; then break; fi
     sleep "$PROVIDER_HTTP_RETRY_DELAY"
     attempt=$((attempt + 1))
   done
+  (umask 077; printf '%s\n' "$failure" >"$result")
   return 1
 }
 
@@ -236,8 +278,10 @@ normalize_reset_timestamp() {
 
 normalize_provider_response() {
   # Print only normalized, presentation-neutral values: percent<TAB>reset-ms.
-  # Known snake/camel variants may coexist only when they normalize identically.
-  local provider=$1 file=$2 row pct reset reset_ms=''
+  # Known snake/camel variants may coexist only when they normalize identically,
+  # including semantically equal seconds/milliseconds/ISO reset forms.
+  local provider=$1 file=$2 row pct value normalized reset_ms=''
+  local -a fields=()
   row=$(jq -er --arg provider "$provider" '
     def finite: (isinfinite or isnan) | not;
     def percent:
@@ -250,36 +294,42 @@ normalize_provider_response() {
       elif type == "string"
         then select(test("^[0-9]+$") or test("^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?([Zz]|[+-][0-9]{2}:[0-9]{2})$"))
       else empty end;
-    def exactly_one($values; $required):
+    def exactly_one($values):
       ($values | map(select(. != null))) as $raw
-      | ($raw | map(percent) | unique) as $normalized
-      | if ($raw | length) != ($raw | map(percent) | length) then error("invalid percent")
+      | ($raw | map(percent)) as $valid
+      | ($valid | unique) as $normalized
+      | if ($raw | length) != ($valid | length) then error("invalid percent")
         elif ($normalized | length) == 1 then $normalized[0]
-        elif ($required and ($normalized | length) == 0) then error("missing percent")
+        elif ($normalized | length) == 0 then error("missing percent")
         else error("ambiguous percent") end;
-    def one_timestamp($values):
+    def timestamps($values):
       ($values | map(select(. != null))) as $raw
-      | ($raw | map(timestamp) | unique) as $normalized
-      | if ($raw | length) != ($raw | map(timestamp) | length) then error("invalid timestamp")
-        elif ($normalized | length) <= 1 then ($normalized[0] // "")
-        else error("ambiguous timestamp") end;
+      | ($raw | map(timestamp)) as $valid
+      | if ($raw | length) != ($valid | length) then error("invalid timestamp")
+        else ($valid | unique) end;
     if type != "object" then error("invalid response")
     elif $provider == "codex" then
       ([.rate_limit.primary_window?, .rate_limit.primaryWindow?,
         .rateLimit.primary_window?, .rateLimit.primaryWindow?] | map(select(type == "object"))) as $windows
-      | exactly_one([$windows[] | .used_percent?, .usedPercent?]; true) as $pct
-      | one_timestamp([$windows[] | .reset_at?, .resetAt?]) as $reset
-      | [$pct, $reset] | @tsv
+      | exactly_one([$windows[] | .used_percent?, .usedPercent?]) as $pct
+      | timestamps([$windows[] | .reset_at?, .resetAt?]) as $resets
+      | ([$pct] + $resets) | @tsv
     elif $provider == "grok" then
-      exactly_one([.config.creditUsagePercent?, .config.credit_usage_percent?]; true) as $pct
-      | one_timestamp([.config.currentPeriod.end?, .config.current_period.end?,
-                       .config.billingPeriodEnd?, .config.billing_period_end?]) as $reset
-      | [$pct, $reset] | @tsv
+      exactly_one([.config.creditUsagePercent?, .config.credit_usage_percent?]) as $pct
+      | timestamps([.config.currentPeriod.end?, .config.current_period.end?,
+                    .config.billingPeriodEnd?, .config.billing_period_end?]) as $resets
+      | ([$pct] + $resets) | @tsv
     else error("unknown provider") end
   ' "$file" 2>/dev/null) || return 1
-  IFS=$'\t' read -r pct reset <<<"$row"
+  IFS=$'\t' read -r -a fields <<<"$row"
+  pct=${fields[0]:-}
   [ -n "$pct" ] || return 1
-  if [ -n "$reset" ]; then reset_ms=$(normalize_reset_timestamp "$reset") || return 1; fi
+  for value in "${fields[@]:1}"; do
+    normalized=$(normalize_reset_timestamp "$value") || return 1
+    if [ -z "$reset_ms" ]; then reset_ms=$normalized
+    elif [ "$reset_ms" != "$normalized" ]; then return 1
+    fi
+  done
   printf '%s\t%s\n' "$pct" "$reset_ms"
 }
 
@@ -344,10 +394,12 @@ CODEX_USAGE_STATE=unavailable
 CODEX_USAGE_OBSERVED_AT=''
 CODEX_USAGE_RATIO=''
 CODEX_USAGE_RESET_AT=''
+CODEX_USAGE_ISSUE=''
 GROK_USAGE_STATE=unavailable
 GROK_USAGE_OBSERVED_AT=''
 GROK_USAGE_RATIO=''
 GROK_USAGE_RESET_AT=''
+GROK_USAGE_ISSUE=''
 QWEN_USAGE_STATE=unavailable
 QWEN_USAGE_OBSERVED_AT=''
 QWEN_WEEKLY_RATIO=''
@@ -996,6 +1048,66 @@ qwen_update() {
   [ -n "$flag" ] && QWEN_L1+="  $flag"
 }
 
+provider_stale_max_secs() {
+  case "$1" in
+    codex) printf '%s' "$CODEX_STALE_MAX_SECS" ;;
+    grok) printf '%s' "$GROK_STALE_MAX_SECS" ;;
+    *) return 1 ;;
+  esac
+}
+
+provider_issue_text() {
+  local provider=$1 issue=$2
+  case "$issue" in
+    login-required) printf 'run qq-models-login %s' "$provider" ;;
+    configuration) printf 'check qq-models auth configuration' ;;
+    provider-error) printf 'provider rejected usage request' ;;
+    response-error) printf 'provider response unsupported' ;;
+    temporary) printf 'temporary provider failure' ;;
+    *) return 1 ;;
+  esac
+}
+
+set_provider_issue() {
+  local provider=$1 issue=$2 state row message
+  case "$issue" in
+    ''|login-required|configuration|provider-error|response-error|temporary) ;;
+    *) issue=temporary ;;
+  esac
+  if [ "$provider" = codex ]; then
+    CODEX_USAGE_ISSUE=$issue; state=$CODEX_USAGE_STATE
+  else
+    GROK_USAGE_ISSUE=$issue; state=$GROK_USAGE_STATE
+  fi
+  if [ "$state" = unavailable ]; then
+    row='7d       unavailable'
+    if [ -n "$issue" ] && message=$(provider_issue_text "$provider" "$issue"); then
+      row+="   ${C_DIM}${message}${C_RESET}"
+    fi
+    if [ "$provider" = codex ]; then GPT_WEEK=$row; else GROK_WEEK=$row; fi
+  elif [ "$state" = stale ] && [ -n "$issue" ] && [ "$issue" != temporary ]; then
+    if message=$(provider_issue_text "$provider" "$issue"); then
+      if [ "$provider" = codex ]; then
+        GPT_WEEK+="   ${C_DIM}${message}${C_RESET}"
+      else
+        GROK_WEEK+="   ${C_DIM}${message}${C_RESET}"
+      fi
+    fi
+  fi
+}
+
+set_provider_unavailable() {
+  local provider=$1 issue=$2
+  if [ "$provider" = codex ]; then
+    CODEX_USAGE_STATE=unavailable
+    CODEX_USAGE_OBSERVED_AT=''; CODEX_USAGE_RATIO=''; CODEX_USAGE_RESET_AT=''
+  else
+    GROK_USAGE_STATE=unavailable
+    GROK_USAGE_OBSERVED_AT=''; GROK_USAGE_RATIO=''; GROK_USAGE_RESET_AT=''
+  fi
+  set_provider_issue "$provider" "$issue"
+}
+
 apply_provider_usage() {
   local provider=$1 state=$2 observed=$3 ratio=$4 reset=$5 nowms=$6
   local pct col row age
@@ -1015,26 +1127,55 @@ apply_provider_usage() {
     CODEX_USAGE_OBSERVED_AT=$observed
     CODEX_USAGE_RATIO=$ratio
     CODEX_USAGE_RESET_AT=$reset
+    CODEX_USAGE_ISSUE=''
   else
     GROK_WEEK=$row
     GROK_USAGE_STATE=$state
     GROK_USAGE_OBSERVED_AT=$observed
     GROK_USAGE_RATIO=$ratio
     GROK_USAGE_RESET_AT=$reset
+    GROK_USAGE_ISSUE=''
   fi
+}
+
+apply_provider_failure() {
+  local provider=$1 issue=$2 state
+  case "$issue" in
+    login-required|configuration|provider-error|response-error|temporary) ;;
+    *) issue=temporary ;;
+  esac
+  if [ "$provider" = codex ]; then state=$CODEX_USAGE_STATE; else state=$GROK_USAGE_STATE; fi
+  if [ "$state" = stale ]; then
+    set_provider_issue "$provider" "$issue"
+  else
+    set_provider_unavailable "$provider" "$issue"
+  fi
+}
+
+provider_request_result() {
+  local file=$1 result=''
+  if [ -f "${file}.result" ] && [ ! -L "${file}.result" ]; then
+    IFS= read -r result <"${file}.result" || result=''
+  fi
+  case "$result" in
+    login-required|provider-error|temporary) printf '%s' "$result" ;;
+    success) printf 'response-error' ;;
+    *) printf 'temporary' ;;
+  esac
 }
 
 load_stale_provider() {
   # Reuse only a strict prior row, preserving its original observation time.
-  # Eligibility is bounded by both 15 minutes and the prior quota reset.
-  local provider=$1 nowms=$2 mode owner size row observed ratio reset
+  # Eligibility is bounded by the provider horizon and the prior quota reset.
+  local provider=$1 nowms=$2 mode owner size row observed ratio reset horizon
+  horizon=$(provider_stale_max_secs "$provider") || return 1
   [ -n "$USAGE_CACHE" ] && [[ "$USAGE_CACHE" == /* ]] || return 1
   [ -f "$USAGE_CACHE" ] && [ ! -L "$USAGE_CACHE" ] && [ -r "$USAGE_CACHE" ] || return 1
   read -r mode owner size < <(stat -c '%a %u %s' -- "$USAGE_CACHE" 2>/dev/null) || return 1
   [ "$mode" = 600 ] && [ "$owner" = "${EUID:-$(id -u)}" ] || return 1
   [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ] && [ "$size" -le "$MAX_USAGE_CACHE_BYTES" ] || return 1
   row=$(jq -er --arg provider "$provider" --argjson now "$nowms" \
-      --argjson horizon "$((PROVIDER_STALE_MAX_SECS * 1000))" '
+      --argjson horizon "$((horizon * 1000))" '
     def finite: (isinfinite or isnan) | not;
     def epoch: type == "number" and finite and floor == . and . >= 0 and . <= 9007199254740991;
     if type != "object" or .schema != "qq.dashboard-usage/v1"
@@ -1049,7 +1190,15 @@ load_stale_provider() {
          or ($row.meters | type) != "array" or ($row.meters | length) != 1
       then error("ineligible cache") else $row end
     | .meters[0] as $meter
-    | if $meter.id != "weekly" or $meter.label != "7d" or $meter.detail != ""
+    | ($row.issue // "") as $issue
+    | (if $issue == "" then ""
+       elif $issue == "login-required" then "run qq-models-login " + $provider
+       elif $issue == "configuration" then "check qq-models auth configuration"
+       elif $issue == "provider-error" then "provider rejected usage request"
+       elif $issue == "response-error" then "provider response unsupported"
+       elif $issue == "temporary" then "temporary provider failure"
+       else null end) as $detail
+    | if $detail == null or $meter.id != "weekly" or $meter.label != "7d" or $meter.detail != $detail
          or ($meter.usedRatio | type) != "number" or ($meter.usedRatio | finite | not)
          or $meter.usedRatio < 0 or $meter.usedRatio > 1
          or (($meter.resetAt == null or ($meter.resetAt | epoch)) | not)
@@ -1064,45 +1213,56 @@ load_stale_provider() {
 fetch_all() {
   local now codex_access='' codex_account='' grok_access=''
   local codex_file='' grok_file='' codex_headers='' grok_headers=''
-  local normalized pct reset frac pid
+  local codex_auth_issue=login-required grok_auth_issue=login-required
+  local normalized pct reset frac pid issue
+  local codex_attempted=0 grok_attempted=0
   local -a pids=()
   [ "$HEADLESS" = 1 ] || load_roles
   GPT_WEEK='7d       unavailable'
   GROK_WEEK='7d       unavailable'
   CODEX_USAGE_STATE=unavailable
-  CODEX_USAGE_OBSERVED_AT=''
-  CODEX_USAGE_RATIO=''
-  CODEX_USAGE_RESET_AT=''
+  CODEX_USAGE_OBSERVED_AT=''; CODEX_USAGE_RATIO=''; CODEX_USAGE_RESET_AT=''; CODEX_USAGE_ISSUE=''
   GROK_USAGE_STATE=unavailable
-  GROK_USAGE_OBSERVED_AT=''
-  GROK_USAGE_RATIO=''
-  GROK_USAGE_RESET_AT=''
+  GROK_USAGE_OBSERVED_AT=''; GROK_USAGE_RATIO=''; GROK_USAGE_RESET_AT=''; GROK_USAGE_ISSUE=''
   now=$(now_epoch)
   USAGE_GENERATED_AT=$((now * 1000))
 
-  # Initialize providers independently from eligible last-good rows. A fresh
-  # success below replaces only its own row; no whole-cache fallback is used.
+  # Initialize independently from eligible last-good rows. Fresh success replaces
+  # only its own row. Every failure keeps an eligible row explicitly stale with
+  # a safe issue; auth/config issues remain actionable and never trigger fallback.
   load_stale_provider codex "$USAGE_GENERATED_AT" || true
   load_stale_provider grok "$USAGE_GENERATED_AT" || true
 
   if provider_credentials codex; then
     codex_access=$AUTH_ACCESS
     codex_account=$AUTH_ACCOUNT
+  else
+    codex_auth_issue=$AUTH_ISSUE
+    [ "$codex_auth_issue" = missing ] && codex_auth_issue=login-required
+    apply_provider_failure codex "$codex_auth_issue"
   fi
-  if provider_credentials grok; then grok_access=$AUTH_ACCESS; fi
+  if provider_credentials grok; then
+    grok_access=$AUTH_ACCESS
+  else
+    grok_auth_issue=$AUTH_ISSUE
+    [ "$grok_auth_issue" = missing ] && grok_auth_issue=login-required
+    apply_provider_failure grok "$grok_auth_issue"
+  fi
 
   if [ -n "$TELEMETRY_TMP" ]; then
     codex_file="$TELEMETRY_TMP/codex.json"
     grok_file="$TELEMETRY_TMP/grok.json"
     codex_headers="$TELEMETRY_TMP/codex.headers"
     grok_headers="$TELEMETRY_TMP/grok.headers"
-    # The temp directory lives for the process. Never let a body from an older
-    # cycle become a new observation when auth/request setup fails this cycle.
-    rm -f -- "$codex_file" "$grok_file" "$codex_headers" "$grok_headers"
+    # The temp directory lives for the process. Never let a body/result from an
+    # older cycle become a new observation when setup fails this cycle.
+    rm -f -- "$codex_file" "$grok_file" "$codex_file.result" "$grok_file.result" \
+      "$codex_headers" "$grok_headers"
     if [ -n "$codex_access" ] && [ -n "$codex_account" ] &&
        (umask 077; printf 'Authorization: Bearer %s\nChatGPT-Account-Id: %s\n' \
           "$codex_access" "$codex_account" >"$codex_headers") &&
        chmod 600 "$codex_headers" 2>/dev/null; then
+      codex_attempted=1
       provider_api_get "$codex_file" 'https://chatgpt.com/backend-api/wham/usage' \
         -H "@$codex_headers" &
       pids+=("$!")
@@ -1110,6 +1270,7 @@ fetch_all() {
     if [ -n "$grok_access" ] &&
        (umask 077; printf 'Authorization: Bearer %s\n' "$grok_access" >"$grok_headers") &&
        chmod 600 "$grok_headers" 2>/dev/null; then
+      grok_attempted=1
       provider_api_get "$grok_file" 'https://cli-chat-proxy.grok.com/v1/billing?format=credits' \
         -H "@$grok_headers" \
         -H "User-Agent: $GROK_USER_AGENT" \
@@ -1122,15 +1283,33 @@ fetch_all() {
     rm -f -- "$codex_headers" "$grok_headers"
   fi
 
-  if [ -s "$codex_file" ] && normalized=$(normalize_provider_response codex "$codex_file"); then
-    IFS=$'\t' read -r pct reset <<<"$normalized"
-    frac=$(awk -v value="$pct" 'BEGIN { print value / 100 }')
-    apply_provider_usage codex ready "$USAGE_GENERATED_AT" "$frac" "$reset" "$USAGE_GENERATED_AT"
+  if [ "$codex_attempted" = 1 ]; then
+    if [ -s "$codex_file" ] && normalized=$(normalize_provider_response codex "$codex_file"); then
+      IFS=$'\t' read -r pct reset <<<"$normalized"
+      frac=$(awk -v value="$pct" 'BEGIN { print value / 100 }')
+      apply_provider_usage codex ready "$USAGE_GENERATED_AT" "$frac" "$reset" "$USAGE_GENERATED_AT"
+    elif [ -s "$codex_file" ]; then
+      apply_provider_failure codex response-error
+    else
+      issue=$(provider_request_result "$codex_file")
+      apply_provider_failure codex "$issue"
+    fi
+  elif [ -n "$codex_access" ]; then
+    apply_provider_failure codex temporary
   fi
-  if [ -s "$grok_file" ] && normalized=$(normalize_provider_response grok "$grok_file"); then
-    IFS=$'\t' read -r pct reset <<<"$normalized"
-    frac=$(awk -v value="$pct" 'BEGIN { print value / 100 }')
-    apply_provider_usage grok ready "$USAGE_GENERATED_AT" "$frac" "$reset" "$USAGE_GENERATED_AT"
+  if [ "$grok_attempted" = 1 ]; then
+    if [ -s "$grok_file" ] && normalized=$(normalize_provider_response grok "$grok_file"); then
+      IFS=$'\t' read -r pct reset <<<"$normalized"
+      frac=$(awk -v value="$pct" 'BEGIN { print value / 100 }')
+      apply_provider_usage grok ready "$USAGE_GENERATED_AT" "$frac" "$reset" "$USAGE_GENERATED_AT"
+    elif [ -s "$grok_file" ]; then
+      apply_provider_failure grok response-error
+    else
+      issue=$(provider_request_result "$grok_file")
+      apply_provider_failure grok "$issue"
+    fi
+  elif [ -n "$grok_access" ]; then
+    apply_provider_failure grok temporary
   fi
 
   qwen_update "$now"
@@ -1149,13 +1328,24 @@ persist_usage_cache() {
       --argjson generated "$USAGE_GENERATED_AT" \
       --arg codex_state "$CODEX_USAGE_STATE" --arg codex_observed "$CODEX_USAGE_OBSERVED_AT" \
       --arg codex_ratio "$CODEX_USAGE_RATIO" --arg codex_reset "$CODEX_USAGE_RESET_AT" \
+      --arg codex_issue "$CODEX_USAGE_ISSUE" \
       --arg grok_state "$GROK_USAGE_STATE" --arg grok_observed "$GROK_USAGE_OBSERVED_AT" \
       --arg grok_ratio "$GROK_USAGE_RATIO" --arg grok_reset "$GROK_USAGE_RESET_AT" \
+      --arg grok_issue "$GROK_USAGE_ISSUE" \
       --arg qwen_state "$QWEN_USAGE_STATE" --arg qwen_observed "$QWEN_USAGE_OBSERVED_AT" \
       --arg qwen_weekly "$QWEN_WEEKLY_RATIO" --arg qwen_weekly_reset "$QWEN_WEEKLY_RESET_AT" \
       --arg qwen_weekly_detail "$QWEN_WEEKLY_DETAIL" --arg qwen_five "$QWEN_FIVE_RATIO" \
       --arg qwen_five_reset "$QWEN_FIVE_RESET_AT" --arg qwen_five_detail "$QWEN_FIVE_DETAIL" '
     def number_or_null($value): try ($value | tonumber) catch null;
+    def issue_or_null($value): if $value == "" then null else $value end;
+    def provider_detail($provider; $state; $issue):
+      if $state != "stale" or $issue == "" then ""
+      elif $issue == "login-required" then "run qq-models-login " + $provider
+      elif $issue == "configuration" then "check qq-models auth configuration"
+      elif $issue == "provider-error" then "provider rejected usage request"
+      elif $issue == "response-error" then "provider response unsupported"
+      elif $issue == "temporary" then "temporary provider failure"
+      else "" end;
     def meter($id; $label; $ratio; $reset; $detail):
       (number_or_null($ratio)) as $used
       | if $used == null then [] else [{
@@ -1166,13 +1356,15 @@ persist_usage_cache() {
       schema: "qq.dashboard-usage/v1",
       generatedAt: $generated,
       providers: [
-        {id: "codex", label: "Codex", state: $codex_state,
+        {id: "codex", label: "Codex", state: $codex_state, issue: issue_or_null($codex_issue),
          observedAt: number_or_null($codex_observed),
-         meters: meter("weekly"; "7d"; $codex_ratio; $codex_reset; "")},
-        {id: "grok", label: "Grok", state: $grok_state,
+         meters: meter("weekly"; "7d"; $codex_ratio; $codex_reset;
+                       provider_detail("codex"; $codex_state; $codex_issue))},
+        {id: "grok", label: "Grok", state: $grok_state, issue: issue_or_null($grok_issue),
          observedAt: number_or_null($grok_observed),
-         meters: meter("weekly"; "7d"; $grok_ratio; $grok_reset; "")},
-        {id: "qwen", label: "Qwen", state: $qwen_state,
+         meters: meter("weekly"; "7d"; $grok_ratio; $grok_reset;
+                       provider_detail("grok"; $grok_state; $grok_issue))},
+        {id: "qwen", label: "Qwen", state: $qwen_state, issue: null,
          observedAt: number_or_null($qwen_observed),
          meters: (meter("weekly"; "7d"; $qwen_weekly; $qwen_weekly_reset; $qwen_weekly_detail)
            + meter("five-hour"; "5h"; $qwen_five; $qwen_five_reset; $qwen_five_detail))}

@@ -101,6 +101,10 @@ non-secret display cache. Startup, retry, disposal/HMR, cache schema, provider
 prerequisites, and security boundaries are documented in
 [Provider usage](docs/provider-usage.md).
 
+Codex/Grok OAuth remains qq-models-owned; the dashboard never refreshes it.
+Failures retain actionable stale data for at most six hours/reset. Use
+`qq-models-login status`, then `qq-models-login <provider>` when required.
+
 Qwen gateway usage requires `qq-dashboard-cookies refresh` and explicit
 operator confirmation. A Firefox profile alone does not initialize Qwen, and
 the producer never bypasses this gate.
@@ -209,7 +213,8 @@ service. The terminal utilities need:
   `QQ_PROFILE_BIN`, for interactive and `--once` profile rendering (not
   headless production);
 - qq-models' Codex/Grok OAuth stores (with validated Pi fallback only when the
-  selected dedicated file is absent) and Pi's Qwen token meter;
+  selected dedicated file is absent), plus `qq-models-login` for OAuth recovery,
+  and Pi's Qwen token meter;
 - Python 3 and Firefox only when refreshing the Qwen browser-cookie snapshot.
 
 Provider credentials stay in the shell producer and never enter Node, the cache,

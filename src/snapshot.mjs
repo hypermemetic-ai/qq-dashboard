@@ -5,6 +5,9 @@ export const DASHBOARD_SCHEMA = "qq.dashboard/v1";
 const SESSION_ID = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UUID_TEXT = /(?:session-)?[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
 const PHASES = new Set(["planning", "plan", "work"]);
+const PROVIDER_ISSUES = new Set([
+  "login-required", "configuration", "provider-error", "response-error", "temporary",
+]);
 
 function text(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -142,6 +145,7 @@ export function normalizeUsage(candidate, fallbackGeneratedAt = Date.now()) {
       id,
       label: displayText(provider.label) || displayText(id) || "provider",
       state: displayText(provider.state) || "unknown",
+      issue: PROVIDER_ISSUES.has(provider.issue) ? provider.issue : null,
       observedAt: epoch(provider.observedAt),
       meters: Object.freeze((Array.isArray(provider.meters) ? provider.meters : [])
         .map(safeMeter)

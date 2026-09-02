@@ -235,10 +235,11 @@ jq -e '
 # an unsafe header file, or an unexpected credential. It records no secret.
 grok_home="$TMP/grok-home"
 grok_auth="$grok_home/.local/state/qq/.qq-grok-auth.json"
+codex_auth="$grok_home/.local/state/qq/.qq-codex-auth.json"
 mkdir -p "$grok_home/.pi/agent" "$(dirname -- "$grok_auth")"
 cat >"$grok_home/.pi/agent/auth.json" <<'JSON'
 {
-  "openai-codex": {"access":"codex-e2e-access","refresh":"codex-e2e-refresh","expires":4102444800000,"accountId":"codex-e2e-account"},
+  "openai-codex": {"access":"legacy-codex-must-not-bypass","refresh":"legacy-codex-refresh","expires":4102444800000,"accountId":"legacy-codex-account"},
   "xai-auth": {"access":"legacy-must-not-bypass","refresh":"legacy-refresh","expires":4102444800000}
 }
 JSON
@@ -246,8 +247,12 @@ chmod 600 "$grok_home/.pi/agent/auth.json"
 cat >"$grok_auth" <<'JSON'
 {"schema":"qq.models-auth/v1","type":"oauth","connector":"grok","access":"dedicated-e2e-token","refresh":"private-refresh","expires":4102444800000}
 JSON
-chmod 600 "$grok_auth"
+cat >"$codex_auth" <<'JSON'
+{"schema":"qq.models-auth/v1","type":"oauth","connector":"codex","access":"codex-e2e-access","refresh":"codex-e2e-refresh","expires":4102444800000,"accountId":"codex-e2e-account"}
+JSON
+chmod 600 "$grok_auth" "$codex_auth"
 cp "$grok_auth" "$TMP/grok-auth-before"
+cp "$codex_auth" "$TMP/codex-auth-before"
 cat >"$TMP/fake-bin/curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -304,6 +309,7 @@ PATH="$TMP/fake-bin:$PATH" GROK_PROBE_LOG="$TMP/grok-request.log" HOME="$grok_ho
   QQ_PROFILE_BIN="$TMP/fake-bin/profile-fail" "$ROOT/bin/qq-dashboard" --once \
   >"$grok_out" 2>"$grok_err"
 cmp "$TMP/grok-auth-before" "$grok_auth"
+cmp "$TMP/codex-auth-before" "$codex_auth"
 grok_cache="$grok_home/.local/state/qq/telemetry/usage-cache.json"
 grep -Fq '37%' "$grok_out"
 if grep -Fq '52%' "$grok_out"; then
@@ -313,7 +319,7 @@ fi
 [[ "$(cat "$TMP/grok-request.log")" == grok-request-ok ]]
 jq -e '
   .providers[0].state == "ready" and
-  .providers[1].state == "ready" and
+  .providers[1].state == "ready" and .providers[1].issue == null and
   .providers[1].meters[0].usedRatio == 0.37 and
   .providers[1].meters[0].resetAt == 2000000000000 and
   .providers[2].state == "unavailable"
@@ -335,11 +341,14 @@ PATH="$TMP/fake-bin:$PATH" GROK_PROBE_LOG="$TMP/grok-request.log" HOME="$grok_ho
 jq -e '
   .providers[0].state == "ready" and
   .providers[1].state == "stale" and
+  .providers[1].issue == "configuration" and
   (.providers[1].observedAt | type) == "number" and
   .providers[1].meters[0].usedRatio == 0.37 and
+  .providers[1].meters[0].detail == "check qq-models auth configuration" and
   .providers[2].state == "unavailable"
 ' "$grok_cache" >/dev/null
-if grep -REq 'legacy-must-not-bypass|\.qq-grok-auth\.json' \
+grep -Fq 'check qq-models auth configuration' "$TMP/grok-rejected.out"
+if grep -REq 'legacy-must-not-bypass|legacy-codex-must-not-bypass|\.qq-grok-auth\.json' \
     "$TMP/grok-rejected.out" "$TMP/grok-rejected.err" "$grok_cache"; then
   echo 'rejected Grok credential leaked or used legacy fallback' >&2
   exit 1
